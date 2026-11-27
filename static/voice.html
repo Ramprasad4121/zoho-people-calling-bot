@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aria — Voice Demo | Zoho People</title>
+<style>
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  padding: 24px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #fff;
+  color: #000;
+}
+a { color: #000; }
+h1, h2, h3 { color: #000; }
+input, select {
+  font: inherit;
+  background: #fff;
+  color: #000;
+  border: 1px solid #000;
+  border-radius: 0;
+}
+button {
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  background: #000;
+  color: #fff;
+  border: 2px solid #000;
+  border-radius: 0;
+}
+button.secondary { background: #fff; color: #000; }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+body { display: grid; place-items: center; }
+.card { width: min(760px, 100%); background: #fff; border: 2px solid #000; padding: 28px; }
+.top-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+h1 { margin: 0; font-size: 26px; letter-spacing: -0.02em; }
+a { font-size: 13px; text-decoration: underline; }
+.sub { margin: 8px 0 14px; color: #000; font-size: 14px; line-height: 1.5; }
+.meta-inputs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
+.meta-inputs input { width: 100%; font-size: 13px; padding: 8px 10px; }
+.badges { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; align-items: center; }
+.badge { display: inline-block; padding: 4px 10px; border: 1px solid #000; background: #fff; color: #000; font-size: 12px; max-width: 100%; overflow-wrap: anywhere; }
+.toggle { font-size: 12px; color: #000; display: flex; align-items: center; gap: 6px; margin-left: auto; cursor: pointer; }
+.transcript { height: 320px; overflow-y: auto; padding: 16px; border: 1px solid #000; background: #fff; display: flex; flex-direction: column; gap: 12px; }
+.msg { max-width: 85%; line-height: 1.5; font-size: 15px; }
+.msg .who { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #000; margin-bottom: 3px; }
+.msg.aria { align-self: flex-start; }
+.msg.you { align-self: flex-end; text-align: right; }
+.msg .text { display: inline-block; padding: 10px 14px; background: #fff; }
+.msg.aria .text { border: 1px solid #000; }
+.msg.you .text { border: 1px dashed #000; }
+.status { min-height: 22px; margin: 12px 2px; color: #000; font-size: 13px; }
+.controls { display: flex; gap: 10px; flex-wrap: wrap; }
+button { padding: 10px 16px; }
+button.secondary { background: #fff; color: #000; }
+button.danger { background: #fff; color: #000; border-style: dashed; }
+.fallback { display: flex; gap: 8px; margin-top: 12px; }
+.fallback input { flex: 1; font-size: 14px; padding: 10px 12px; }
+.qual { margin-top: 12px; border: 1px solid #000; background: #fff; font-size: 12px; color: #000; }
+.qual h2 { margin: 0; padding: 8px 12px; border-bottom: 1px solid #000; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+.qual-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; background: #000; }
+.qual-field { background: #fff; padding: 8px 12px; min-width: 0; }
+.qual-label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+.qual-value { display: block; margin-top: 2px; overflow-wrap: anywhere; }
+@media (max-width: 680px) { .meta-inputs { grid-template-columns: 1fr 1fr; } .qual-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main class="card">
+  <div class="top-row">
+    <h1>Aria <span>·</span> Zoho People Voice</h1>
+    <a href="/">← Lead Console</a>
+  </div>
+  <p class="sub">Real-time voice conversation in your browser mic and speakers, or type below anytime.</p>
+
+  <div class="meta-inputs">
+    <input id="leadName" value="Alex" placeholder="Lead name">
+    <input id="companyName" value="Acme" placeholder="Company">
+    <input id="teamSize" placeholder="Team size (e.g. 80)">
+    <input id="primaryInterest" placeholder="Interest (e.g. Attendance)">
+  </div>
+
+  <div class="badges">
+    <span class="badge" id="mode">mode: ready</span>
+    <label class="toggle">
+      <input type="checkbox" id="autoListen" checked> Hands-free auto-listen
+    </label>
+  </div>
+
+  <section class="transcript" id="transcript" aria-live="polite">
+    <div class="msg aria"><span class="who">Aria</span><span class="text">Press <strong>Start call</strong> to begin.</span></div>
+  </section>
+
+  <div class="status" id="status">Ready.</div>
+  <div class="controls">
+    <button id="startBtn">Start call</button>
+    <button id="speakBtn" class="secondary" disabled>Speak</button>
+    <button id="endBtn" class="danger" disabled>End call</button>
+    <button id="copyBtn" class="secondary" type="button">Copy share link</button>
+  </div>
+
+  <form class="fallback" id="fallbackForm">
+    <input id="textInput" autocomplete="off" placeholder="Or type your reply anytime during a call…">
+    <button type="submit" class="secondary">Send</button>
+  </form>
+
+  <div class="qual" id="qualBox" hidden></div>
+</main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let sessionId = null, busy = false, callActive = false, gotResult = false, activeRec = null;
+
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("lead_name")) $("leadName").value = params.get("lead_name");
+  if (params.get("company_name")) $("companyName").value = params.get("company_name");
+  if (params.get("team_size")) $("teamSize").value = params.get("team_size");
+  if (params.get("primary_interest")) $("primaryInterest").value = params.get("primary_interest");
+
+  function addMessage(who, text) {
+    const row = document.createElement("div");
+    row.className = "msg " + who;
+    const label = document.createElement("span");
+    label.className = "who";
+    label.textContent = who === "you" ? ($("leadName").value.trim() || "You") : "Aria";
+    const body = document.createElement("span");
+    body.className = "text";
+    body.textContent = text;
+    row.append(label, body);
+    $("transcript").appendChild(row);
+    $("transcript").scrollTop = $("transcript").scrollHeight;
+  }
+
+  function setStatus(text) { $("status").textContent = text; }
+
+  async function copyShareLink() {
+    const share = new URL("/web", window.location.origin);
+    share.searchParams.set("lead_name", $("leadName").value.trim());
+    share.searchParams.set("company_name", $("companyName").value.trim());
+    share.searchParams.set("team_size", $("teamSize").value.trim());
+    share.searchParams.set("primary_interest", $("primaryInterest").value.trim());
+    share.searchParams.set("autostart", "1");
+    const link = share.toString();
+    try {
+      await navigator.clipboard.writeText(link);
+      setStatus("Share link copied.");
+    } catch (err) {
+      const box = document.createElement("textarea");
+      box.value = link;
+      box.style.position = "fixed";
+      box.style.opacity = "0";
+      document.body.appendChild(box);
+      box.select();
+      const copied = document.execCommand("copy");
+      box.remove();
+      setStatus(copied ? "Share link copied." : "Copy failed. Check clipboard permission.");
+    }
+  }
+
+  const qualFields = [
+    ["Team size", "team_size"],
+    ["Topics", "topics"],
+    ["Budget", "budget"],
+    ["Authority", "authority"],
+    ["Timeline", "timeline"],
+    ["Appointment", "appointment"],
+    ["Next step", "next_step"],
+  ];
+
+  function renderQualification(q) {
+    if (!q) return;
+    $("qualBox").hidden = false;
+    $("qualBox").innerHTML = '<h2>Captured qualification</h2><div class="qual-grid">' +
+      qualFields.map(([label]) => '<div class="qual-field"><span class="qual-label">' + label +
+        '</span><span class="qual-value"></span></div>').join("") + '</div>';
+    const values = $("qualBox").querySelectorAll(".qual-value");
+    qualFields.forEach(([, key], i) => {
+      const raw = q[key];
+      const value = key === "topics" && Array.isArray(raw) ? raw.join(", ") : (raw || "");
+      values[i].textContent = value || "Not captured yet";
+    });
+  }
+
+  function speak(text, done) {
+    if (!window.speechSynthesis) { done(); return; }
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(watchdog);
+      done();
+    };
+    const watchdog = setTimeout(finish, Math.max(4500, text.length * 85));
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "en-IN";
+    utterance.rate = 1;
+    const voices = window.speechSynthesis.getVoices();
+    const voice = voices.find(v => v.lang === "en-IN") || voices.find(v => v.lang.startsWith("en"));
+    if (voice) utterance.voice = voice;
+    utterance.onend = finish;
+    utterance.onerror = finish;
+    window.speechSynthesis.speak(utterance);
+  }
+
+  function afterAriaSpeaks(shouldEnd) {
+    if (shouldEnd) { endCall("Call ended by Aria.", false); return; }
+    if (!callActive) return;
+    busy = false;
+    $("speakBtn").disabled = false;
+    if ($("autoListen").checked && SpeechRecognition) {
+      listen();
+    } else {
+      setStatus("Your turn — press Speak or type below.");
+    }
+  }
+
+  async function startCall() {
+    $("startBtn").disabled = true;
+    setStatus("Starting call…");
+    try {
+      const res = await fetch("/web/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          lead_name: $("leadName").value.trim() || "Alex",
+          company_name: $("companyName").value.trim() || "Acme",
+          team_size: $("teamSize").value.trim(),
+          primary_interest: $("primaryInterest").value.trim(),
+          email: params.get("email") || "",
+        })
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      sessionId = data.session_id;
+      callActive = true;
+      busy = true;
+      $("transcript").innerHTML = "";
+      $("qualBox").hidden = true;
+      addMessage("aria", data.greeting);
+      $("endBtn").disabled = false;
+      setStatus("Aria is speaking…");
+      speak(data.greeting, () => afterAriaSpeaks(false));
+    } catch (err) {
+      setStatus("Could not start call: " + err.message);
+      $("startBtn").disabled = false;
+    }
+  }
+
+  function listen() {
+    if (!callActive || busy || !SpeechRecognition) return;
+    busy = true;
+    gotResult = false;
+    $("speakBtn").disabled = true;
+    setStatus("Listening…");
+    const rec = new SpeechRecognition();
+    activeRec = rec;
+    rec.lang = "en-IN";
+    rec.interimResults = false;
+    rec.maxAlternatives = 1;
+    rec.onresult = (event) => {
+      gotResult = true;
+      const text = (event.results[0][0].transcript || "").trim();
+      if (!text) {
+        busy = false;
+        $("speakBtn").disabled = false;
+        setStatus("Didn't catch that — press Speak or type below.");
+        return;
+      }
+      addMessage("you", text);
+      sendTurn(text);
+    };
+    rec.onerror = (event) => {
+      setStatus("Mic note: " + event.error + " — press Speak or type below.");
+      if (!gotResult) { busy = false; $("speakBtn").disabled = false; }
+    };
+    rec.onend = () => {
+      activeRec = null;
+      if (!gotResult && busy && callActive) {
+        busy = false;
+        $("speakBtn").disabled = false;
+        setStatus("Listening paused. Press Speak or type below.");
+      }
+    };
+    rec.start();
+  }
+
+  async function sendTurn(text) {
+    setStatus("Aria is thinking…");
+    try {
+      const res = await fetch("/web/turn", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, message: text })
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      $("mode").textContent = "mode: " + data.mode;
+      renderQualification(data.qualification);
+      addMessage("aria", data.reply);
+      setStatus("Aria is speaking…");
+      speak(data.reply, () => afterAriaSpeaks(data.end_call));
+    } catch (err) {
+      busy = false;
+      $("speakBtn").disabled = false;
+      setStatus("Error: " + err.message);
+    }
+  }
+
+  async function endCall(message, notifyServer = true) {
+    const oldSession = sessionId;
+    callActive = false;
+    busy = false;
+    sessionId = null;
+    if (activeRec) { try { activeRec.abort(); } catch {} activeRec = null; }
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    $("speakBtn").disabled = true;
+    $("endBtn").disabled = true;
+    $("startBtn").disabled = false;
+    setStatus(message);
+    if (notifyServer && oldSession) {
+      try {
+        await fetch("/web/end", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: oldSession })
+        });
+      } catch {}
+    }
+  }
+
+  $("startBtn").addEventListener("click", startCall);
+  $("speakBtn").addEventListener("click", listen);
+  $("copyBtn").addEventListener("click", copyShareLink);
+  $("endBtn").addEventListener("click", () => {
+    endCall("Call ended. Press Start call to run it again.", true);
+  });
+  $("fallbackForm").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const text = $("textInput").value.trim();
+    if (!text || !callActive || busy) return;
+    if (activeRec) { try { activeRec.abort(); } catch {} activeRec = null; }
+    $("textInput").value = "";
+    busy = true;
+    $("speakBtn").disabled = true;
+    addMessage("you", text);
+    sendTurn(text);
+  });
+
+  if (!SpeechRecognition) {
+    $("autoListen").checked = false;
+    $("autoListen").disabled = true;
+    $("speakBtn").title = "Speech recognition is unavailable in this browser — type below instead.";
+  }
+  if (params.get("autostart") === "1") {
+    startCall();
+  }
+</script>
+</body>
+</html>

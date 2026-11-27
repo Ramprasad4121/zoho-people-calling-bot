@@ -1,0 +1,52 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.local
+ngrok.yml
+.ngrok.yml
+credentials.json
+*-credentials.json
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Runtime data, logs, and generated artifacts
+data/
+call_history.json
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.pid
+*.sock
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Editor, OS, and build noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+build/
+dist/
+*.tmp
+*.bak
+*.swp
+*.orig
+
+# Private working notes
+INTERVIEW_PREP.md

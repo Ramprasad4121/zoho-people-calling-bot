@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call List — Zoho People</title>
+<style>
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  padding: 24px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #fff;
+  color: #000;
+}
+a { color: #000; }
+h1, h2, h3 { color: #000; }
+input, select {
+  font: inherit;
+  background: #fff;
+  color: #000;
+  border: 1px solid #000;
+  border-radius: 0;
+}
+button {
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  background: #000;
+  color: #fff;
+  border: 2px solid #000;
+  border-radius: 0;
+}
+button.secondary { background: #fff; color: #000; }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.card { width: min(920px, 100%); margin: 0 auto; background: #fff; border: 2px solid #000; padding: 28px; }
+h1 { margin: 0; font-size: 26px; letter-spacing: -0.02em; }
+h2 { margin: 26px 0 12px; font-size: 15px; color: #000; font-weight: 700; }
+.sub { margin: 8px 0 14px; color: #000; font-size: 14px; line-height: 1.5; }
+.toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.badge { display: inline-block; padding: 4px 10px; border: 1px solid #000; background: #fff; color: #000; font-size: 12px; }
+a { color: #000; font-size: 13px; }
+.row { display: grid; grid-template-columns: 1fr 1fr 1.2fr auto; gap: 8px; margin-bottom: 8px; align-items: center; }
+.row.head { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #000; font-weight: 700; }
+input { width: 100%; font-size: 14px; padding: 10px 12px; }
+input::placeholder { color: #000; }
+.controls { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+button { font-size: 14px; padding: 10px 16px; }
+button.icon { padding: 8px 11px; color: #000; border-style: dashed; }
+#results { display: flex; flex-direction: column; gap: 10px; }
+.call { border: 1px solid #000; padding: 14px 16px; background: #fff; }
+.call-top { display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap; }
+.who { font-weight: 700; font-size: 15px; }
+.number { color: #000; font-size: 13px; margin-left: 8px; }
+.status { font-size: 12px; padding: 4px 10px; border: 1px solid #000; background: #fff; color: #000; }
+.status.done { font-weight: 700; border-width: 2px; }
+.status.bad { border-style: dashed; border-width: 2px; }
+.meta { margin-top: 6px; font-size: 12px; color: #000; }
+details { margin-top: 10px; font-size: 13px; }
+summary { cursor: pointer; color: #000; font-weight: 700; }
+.line { margin: 6px 0; line-height: 1.5; }
+.line b { color: #000; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; margin-right: 6px; }
+#summary { color: #000; font-size: 13px; margin-top: 10px; }
+.note { margin: 20px 2px 0; font-size: 12px; color: #000; line-height: 1.6; }
+code { color: #000; font-weight: 700; }
+@media (max-width: 640px) { .row { grid-template-columns: 1fr; } .row.head { display: none; } }
+</style>
+</head>
+<body>
+<main class="card">
+  <h1>Call <span>list</span></h1>
+  <p class="sub">Add the numbers you want Aria to dial. She greets each person, listens, and answers with the Zoho People knowledge base plus a free AI model.</p>
+  <div class="toolbar">
+    <span class="badge" id="badge">Checking Twilio…</span>
+    <a href="/">← Lead Registration Console</a>
+    <a href="/web">Browser Voice Demo →</a>
+  </div>
+
+  <h2>Numbers to call</h2>
+  <div class="row head">
+    <span>Name</span><span>Company</span><span>Phone (E.164)</span><span></span>
+  </div>
+  <div id="rows"></div>
+  <div class="controls">
+    <button id="addBtn" class="secondary">+ Add number</button>
+    <button id="callBtn">Call all numbers</button>
+    <button id="clearBtn" class="secondary">Clear results</button>
+  </div>
+
+  <section id="resultsSection" hidden>
+    <h2>Call status</h2>
+    <div id="results"></div>
+    <div id="summary"></div>
+  </section>
+
+  <p class="note">
+    Use international format like <code>+15551234567</code>. Twilio trial accounts can only call verified recipients and only in the sign-up country; the trial includes 75 voice minutes for 30 days.
+    Keep the tunnel URL private — anyone with it can start calls.
+  </p>
+</main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const LIVE = new Set(["queued", "initiated", "ringing", "in-progress"]);
+  const DONE = new Set(["completed"]);
+  const BAD = new Set(["error", "failed", "busy", "no-answer", "canceled"]);
+  let launched = [];
+
+  function addRow(values = {}) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const fields = [
+      ["lead_name", "Name", values.lead_name || ""],
+      ["company_name", "Company", values.company_name || ""],
+      ["to_number", "+91... ", values.to_number || ""],
+    ];
+    fields.forEach(([key, placeholder, value]) => {
+      const input = document.createElement("input");
+      input.dataset.key = key;
+      input.placeholder = placeholder;
+      input.value = value;
+      row.appendChild(input);
+    });
+    const remove = document.createElement("button");
+    remove.className = "secondary icon";
+    remove.textContent = "×";
+    remove.title = "Remove row";
+    remove.addEventListener("click", () => {
+      row.remove();
+      if (!document.querySelectorAll("#rows .row").length) addRow();
+    });
+    row.appendChild(remove);
+    $("rows").appendChild(row);
+  }
+
+  addRow({ lead_name: "Alex", company_name: "Acme", to_number: "+15551234567" });
+  addRow();
+  addRow();
+
+  $("addBtn").addEventListener("click", () => addRow());
+
+  function collectContacts() {
+    const contacts = [];
+    for (const row of document.querySelectorAll("#rows .row")) {
+      const get = (key) => row.querySelector(`[data-key="${key}"]`).value.trim();
+      const contact = {
+        lead_name: get("lead_name") || "there",
+        company_name: get("company_name") || "your team",
+        to_number: get("to_number"),
+      };
+      if (!contact.to_number && contact.lead_name === "there") continue;
+      if (!/^\+\d{8,15}$/.test(contact.to_number)) {
+        throw new Error(`"${contact.to_number}" is not a valid E.164 number (example: +15551234567).`);
+      }
+      contacts.push(contact);
+    }
+    return contacts;
+  }
+
+  function statusText(item) {
+    return item.record?.status || item.status || "queued";
+  }
+
+  function render() {
+    const box = $("results");
+    box.innerHTML = "";
+    launched.forEach((item) => {
+      const card = document.createElement("article");
+      card.className = "call";
+
+      const top = document.createElement("div");
+      top.className = "call-top";
+      const who = document.createElement("span");
+      who.className = "who";
+      who.textContent = item.record?.lead_name || item.lead_name || "Contact";
+      const number = document.createElement("span");
+      number.className = "number";
+      number.textContent = item.to || item.to_number;
+      const status = document.createElement("span");
+      const state = statusText(item);
+      status.className = "status" + (BAD.has(state) ? " bad" : DONE.has(state) ? " done" : "");
+      status.textContent = item.error ? "error: " + item.error : state;
+      top.append(who, number, status);
+      card.appendChild(top);
+
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = item.record?.duration
+        ? `Duration: ${item.record.duration}s · ${item.record.company_name || ""}`
+        : (item.record?.company_name || item.company_name || "");
+      card.appendChild(meta);
+
+      const transcript = item.record?.transcript || [];
+      if (transcript.length) {
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = `Transcript (${transcript.length} messages)`;
+        details.appendChild(summary);
+        transcript.forEach((line) => {
+          const div = document.createElement("div");
+          div.className = "line";
+          const label = document.createElement("b");
+          label.textContent = line.role === "user" ? "They said" : "Aria";
+          div.append(label, document.createTextNode(line.text));
+          details.appendChild(div);
+        });
+        card.appendChild(details);
+      }
+      box.appendChild(card);
+    });
+
+    const finished = launched.filter((i) => !BAD.has(statusText(i)) && DONE.has(statusText(i))).length;
+    $("summary").textContent = launched.length
+      ? `${launched.length} call(s) launched · ${finished} completed`
+      : "";
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch("/web/calls/status");
+      if (!res.ok) return;
+      const data = await res.json();
+      const bySid = new Map(data.calls.map((call) => [call.call_sid, call]));
+      launched.forEach((item) => {
+        if (item.call_sid && bySid.has(item.call_sid)) item.record = bySid.get(item.call_sid);
+      });
+      render();
+      if (launched.some((i) => !i.error && LIVE.has(statusText(i)))) {
+        setTimeout(poll, 3000);
+      }
+    } catch (err) {
+      $("badge").textContent = "Status unavailable: " + err.message;
+    }
+  }
+
+  $("callBtn").addEventListener("click", async () => {
+    let contacts;
+    try {
+      contacts = collectContacts();
+    } catch (err) {
+      alert(err.message);
+      return;
+    }
+    if (!contacts.length) {
+      alert("Add at least one phone number.");
+      return;
+    }
+    const summary = contacts.map((c) => `${c.lead_name}: ${c.to_number}`).join("\n");
+    if (!confirm(`Place ${contacts.length} call(s) now?\n\n${summary}\n\nTwilio minutes are used for each answered call.`)) return;
+
+    $("callBtn").disabled = true;
+    $("badge").textContent = "Starting calls…";
+    try {
+      const res = await fetch("/web/calls", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contacts }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      launched = data.calls;
+      $("resultsSection").hidden = false;
+      $("badge").textContent = `${launched.length} call(s) launched`;
+      render();
+      poll();
+    } catch (err) {
+      $("badge").textContent = "Could not start calls: " + err.message;
+    } finally {
+      $("callBtn").disabled = false;
+    }
+  });
+
+  $("clearBtn").addEventListener("click", () => {
+    launched = [];
+    $("resultsSection").hidden = true;
+    $("badge").textContent = "Ready";
+  });
+
+  fetch("/health")
+    .then((r) => r.json())
+    .then((data) => { $("badge").textContent = "Bot online · active calls: " + data.active_calls; })
+    .catch(() => { $("badge").textContent = "Bot unreachable — is the container running?"; });
+</script>
+</body>
+</html>

@@ -1,0 +1,173 @@
+{
+  "product_name": "Zoho People",
+  "source_url": "https://www.zoho.com/people/features.html?src=people-header",
+  "tagline": "Unleash the full potential of your diverse workforce",
+  "social_proof": {
+    "users": "1M+ Users",
+    "organizations": "30K+ Organizations",
+    "countries": "150+ Countries"
+  },
+  "modules": [
+    {
+      "category": "Hiring & Onboarding",
+      "features": [
+        {
+          "name": "Integrated Recruitment",
+          "summary": "End-to-end recruitment software (via Zoho Recruit integration) with Zia candidate matching to hire faster and build a positive workplace culture."
+        },
+        {
+          "name": "Employee Onboarding",
+          "summary": "Seamless onboarding workflows so new hires complete procedures quickly and hit the ground running from day one."
+        }
+      ]
+    },
+    {
+      "category": "Core HR",
+      "features": [
+        {
+          "name": "Employee Management",
+          "summary": "Centralized employee database (DBMS) to securely store records, classify your workforce, and empower employees with self-service."
+        },
+        {
+          "name": "Attendance Management",
+          "summary": "Web and mobile check-ins with IP and location-based restrictions, plus biometric integrations and facial recognition for real-time attendance."
+        },
+        {
+          "name": "Shift & Roster Management",
+          "summary": "Define, manage, and regulate 24/7 shifts, breaks, and payable vs. non-payable work items."
+        },
+        {
+          "name": "Leave Management (Time-Off)",
+          "summary": "Customizable time-off policies, easy leave submissions, quick approvals, and consolidated views of leave balances and holidays."
+        },
+        {
+          "name": "Timesheets",
+          "summary": "Track ongoing and completed projects, allocate jobs, monitor team workloads, and bill clients accurately on time."
+        },
+        {
+          "name": "HR Help Desk",
+          "summary": "Dedicated HR agents, built-in SLA capabilities, and an accessible knowledge base to resolve employee queries and grievances promptly."
+        },
+        {
+          "name": "Document Management",
+          "summary": "Centralized repository to store files, generate documents from templates, request electronic signatures, and share securely."
+        },
+        {
+          "name": "Offboarding Management",
+          "summary": "Structured clearance processes, responsibility transfers, exit interviews, access revocation, and compliant paperwork for departing employees."
+        }
+      ]
+    },
+    {
+      "category": "Talent Management",
+      "features": [
+        {
+          "name": "Performance Management",
+          "summary": "Appraisal dashboards and performance frameworks to track team performance, individual skills, and business outcomes."
+        },
+        {
+          "name": "OKR",
+          "summary": "Align and motivate your workforce with outcome-driven Objectives and Key Results to drive accountability and visibility."
+        },
+        {
+          "name": "Compensation & Benefits",
+          "summary": "Transparent compensation management with role-based salary structures, bonuses, allowances, and benefits administration."
+        },
+        {
+          "name": "Learning Management System (LMS)",
+          "summary": "Personalized learning experiences based on department, experience, or role to support employee growth and upskilling."
+        }
+      ]
+    },
+    {
+      "category": "Payroll & Expense",
+      "features": [
+        {
+          "name": "Integrated Payroll",
+          "summary": "Seamless Zoho People and Zoho Payroll integration for accurate, on-time pay runs and stress-free paydays."
+        },
+        {
+          "name": "Travel & Expense",
+          "summary": "Integrated with Zoho Expense to record expenses, share receipts, and streamline reporting with real-time data sync."
+        }
+      ]
+    },
+    {
+      "category": "Employee Engagement & Analytics",
+      "features": [
+        {
+          "name": "Employee Engagement & Collaboration",
+          "summary": "eNPS surveys, engagement surveys, and business chat/collaboration tools to foster belonging and measure workplace culture."
+        },
+        {
+          "name": "HR Analytics",
+          "summary": "Comprehensive reports and analytics giving a bird's-eye view of HR metrics and overall business performance."
+        },
+        {
+          "name": "HR Automation & Custom Services",
+          "summary": "Automate repetitive tasks with workflows, automatic field updates, mail alerts, webhooks, custom forms, and Zia AI."
+        }
+      ]
+    },
+    {
+      "category": "Integrations & Mobile",
+      "features": [
+        {
+          "name": "Native & Third-Party Integrations",
+          "summary": "Integrates with Zoho CRM, Zoho Projects, Zoho Mail, Zoho Sign, Zoho Payroll, Zoho Expense, Zoho Recruit, Microsoft Teams, Slack, Adobe Sign, GreytHR, and Zapier."
+        },
+        {
+          "name": "Mobile App (iOS & Android)",
+          "summary": "HRMS in your pocket—apply for leave, log time, approve requests, and clock in/out with geo-fencing from anywhere."
+        },
+        {
+          "name": "Zia AI Assistant",
+          "summary": "Built-in conversational AI assistant that lets employees check leave balances, punch in/out via chat, and get instant answers to HR policy queries."
+        }
+      ]
+    }
+  ],
+  "pricing_india": {
+    "currency": "INR",
+    "free_trial": "30-day free trial on paid plans, no credit card required",
+    "tax_note": "Prices exclude 18% GST; custom quotes available for 500+ users",
+    "payroll_note": "Core Zoho People plans do not include payroll; payroll integrates via Zoho Payroll or the all-in-one Zoho People Plus suite",
+    "plans": [
+      {
+        "name": "Free",
+        "annual_per_user_month": 0,
+        "monthly_per_user_month": 0,
+        "highlights": "Up to 5 users; basic employee database, document management, and leave tracking"
+      },
+      {
+        "name": "Essential HR",
+        "annual_per_user_month": 48,
+        "monthly_per_user_month": 60,
+        "highlights": "Onboarding, offboarding, basic HR reports, workflows, and Zia AI assistant"
+      },
+      {
+        "name": "Professional",
+        "annual_per_user_month": 96,
+        "monthly_per_user_month": 120,
+        "highlights": "Adds attendance management, shift & roster scheduling, and timesheets"
+      },
+      {
+        "name": "Premium",
+        "annual_per_user_month": 144,
+        "monthly_per_user_month": 180,
+        "highlights": "Adds performance management (KRAs, goals, 360-degree feedback), compensation, and employee engagement"
+      },
+      {
+        "name": "Enterprise",
+        "annual_per_user_month": 192,
+        "monthly_per_user_month": 240,
+        "highlights": "Adds HR help desk (SLAs & ticketing), Learning Management System (LMS), and sandbox environment"
+      }
+    ]
+  },
+  "next_steps": [
+    "Sign up for a 30-day free trial of Zoho People",
+    "Schedule a personalized 15-minute live product demo",
+    "Request a custom price quote based on team size"
+  ]
+}
