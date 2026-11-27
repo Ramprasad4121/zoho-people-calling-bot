@@ -204,7 +204,16 @@ class _TextExtractor:
 
 
 def _fetch_text(url: str) -> str:
-    raw = fetch_url(url, timeout=5, max_bytes=400_000)
+    raw = fetch_url(
+        url,
+        timeout=5,
+        max_bytes=400_000,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
     extractor = _TextExtractor()
     extractor.feed(raw.decode("utf-8", errors="replace"))
     return extractor.text()

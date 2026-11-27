@@ -205,8 +205,8 @@ def handoff_number() -> str:
 
 class OutboundCallRequest(BaseModel):
     to_number: str = Field(..., max_length=32)
-    lead_name: str = Field(default="Alex", max_length=100)
-    company_name: str = Field(default="Acme", max_length=100)
+    lead_name: str = Field(default="", max_length=100)
+    company_name: str = Field(default="", max_length=100)
     team_size: str = Field(default="", max_length=60)
     primary_interest: str = Field(default="", max_length=120)
     email: str = Field(default="", max_length=200)
@@ -218,7 +218,7 @@ class BatchCallRequest(BaseModel):
 
 class LeadRegistrationRequest(BaseModel):
     lead_name: str = Field(..., max_length=100)
-    company_name: str = Field(default="Acme", max_length=100)
+    company_name: str = Field(default="", max_length=100)
     to_number: str = Field(default="", max_length=32)
     team_size: str = Field(default="", max_length=60)
     primary_interest: str = Field(default="", max_length=120)
@@ -227,8 +227,8 @@ class LeadRegistrationRequest(BaseModel):
 
 
 class WebStartRequest(BaseModel):
-    lead_name: str = Field(default="Alex", max_length=100)
-    company_name: str = Field(default="Acme", max_length=100)
+    lead_name: str = Field(default="", max_length=100)
+    company_name: str = Field(default="", max_length=100)
     team_size: str = Field(default="", max_length=60)
     primary_interest: str = Field(default="", max_length=120)
     email: str = Field(default="", max_length=200)
@@ -315,8 +315,8 @@ def place_outbound_call(payload: OutboundCallRequest) -> dict:
 
     now = time.monotonic()
     with STATE_LOCK:
-        recent = LAST_CALL_REQUEST.get(to_number, 0)
-        if now - recent < DUPLICATE_CALL_WINDOW_SECONDS:
+        recent = LAST_CALL_REQUEST.get(to_number)
+        if recent is not None and now - recent < DUPLICATE_CALL_WINDOW_SECONDS:
             raise HTTPException(status_code=409, detail="A call to this number was just initiated. Please wait before retrying.")
         if any(
             session.get("to_number") == to_number and session.get("status") in ACTIVE_CALL_STATUSES
@@ -920,8 +920,8 @@ def _web_start(payload: WebStartRequest) -> dict:
         "primary_interest": payload.primary_interest.strip(),
         "email": payload.email.strip(),
     }
-    lead_name = payload.lead_name.strip() or "Alex"
-    company_name = payload.company_name.strip() or "Acme"
+    lead_name = payload.lead_name.strip() or "there"
+    company_name = payload.company_name.strip() or "your company"
     greeting = build_greeting(
         lead_name,
         company_name,
