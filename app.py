@@ -76,10 +76,12 @@ def get_llm_client() -> tuple[OpenAI, str]:
         raise RuntimeError("Missing LLM_API_KEY / OPENAI_API_KEY / GROQ_API_KEY in environment.")
     base_url = os.getenv("LLM_BASE_URL") or None
     model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    if base_url:
+        logger.info("Using LLM base_url=%s model=%s", base_url, model)
     client = (
-        OpenAI(api_key=api_key, base_url=base_url, timeout=3.0, max_retries=0)
+        OpenAI(api_key=api_key, base_url=base_url, timeout=20.0, max_retries=0)
         if base_url
-        else OpenAI(api_key=api_key, timeout=3.0, max_retries=0)
+        else OpenAI(api_key=api_key, timeout=20.0, max_retries=0)
     )
     return client, model
 
@@ -268,6 +270,7 @@ def health():
     )
     public_url = (os.getenv("PUBLIC_BASE_URL") or "").strip()
     public_ok = public_url.startswith("https://")
+    llm_base = (os.getenv("LLM_BASE_URL") or "").strip()
     return {
         "status": "ok",
         "active_calls": len(CALL_SESSIONS),
@@ -275,6 +278,7 @@ def health():
         "recorded_calls": len(CALL_RECORDS),
         "llm_configured": bool(llm_key),
         "llm_model": os.getenv("LLM_MODEL", "gpt-4o-mini") if llm_key else "offline-kb-rules",
+        "llm_base_url": llm_base if llm_key else "",
         "twilio_configured": twilio_ok,
         "public_base_url_configured": public_ok,
         "public_base_url": public_url if public_ok else "",
@@ -477,9 +481,12 @@ async def twilio_voice_entry(
     record_message(CallSid, "assistant", greeting)
 
     vr = VoiceResponse()
+    base = public_base_url()
+    action_url = f"{base}/twilio/respond" if base else "/twilio/respond"
     gather = Gather(
         input="speech",
         method="POST",
+        action=action_url,
         speech_timeout="auto",
         timeout=6,
         language="en-IN",
@@ -515,15 +522,19 @@ async def twilio_respond(
             CALL_SESSIONS.pop(CallSid, None)
             return Response(content=str(vr), media_type="application/xml")
 
+        base = public_base_url()
+        action_url = f"{base}/twilio/respond" if base else "/twilio/respond"
         gather = Gather(
             input="speech",
             method="POST",
+            action=action_url,
             speech_timeout="auto",
             timeout=6,
             language="en-IN",
         )
         gather.say("Sorry, I didn't quite catch that—could you repeat?", voice="Polly.Aditi")
         vr.append(gather)
+        vr.say("I still didn't catch that. Feel free to reach out anytime. Goodbye!", voice="Polly.Aditi")
         return Response(content=str(vr), media_type="application/xml")
 
     session["silence_count"] = 0
@@ -550,15 +561,19 @@ async def twilio_respond(
         vr.hangup()
         CALL_SESSIONS.pop(CallSid, None)
     else:
+        base = public_base_url()
+        action_url = f"{base}/twilio/respond" if base else "/twilio/respond"
         gather = Gather(
             input="speech",
             method="POST",
+            action=action_url,
             speech_timeout="auto",
             timeout=6,
             language="en-IN",
         )
         gather.say(spoken_reply, voice="Polly.Aditi")
         vr.append(gather)
+        vr.say("I didn't catch that. Feel free to reach out anytime. Goodbye!", voice="Polly.Aditi")
 
     return Response(content=str(vr), media_type="application/xml")
 
