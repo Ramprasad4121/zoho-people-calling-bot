@@ -114,7 +114,7 @@ def build_greeting(
         )
     if company_name and company_name not in ("your team", "your company"):
         return (
-            f"{disclosure} I saw your interest for {company_name}. "
+            f"{disclosure} I saw that {company_name} registered interest with us. "
             "I would love to learn a bit about your HR setup. What is the biggest challenge your team is trying to solve right now?"
         )
     return (
