@@ -362,7 +362,7 @@ def place_outbound_call(payload: OutboundCallRequest) -> dict:
             url=f"{base_url}/twilio/voice?token={quote(session['webhook_token'])}",
             method="POST",
             status_callback=f"{base_url}/twilio/status",
-            status_callback_event=["initiated", "ringing", "in-progress", "completed"],
+            status_callback_event=["initiated", "ringing", "answered", "completed"],
         )
     except TwilioRestException as exc:
         _cleanup_pending(temp_sid, to_number)
@@ -409,12 +409,18 @@ def _cleanup_pending(temp_sid: str, to_number: str) -> None:
 def _twilio_error_detail(exc: TwilioRestException) -> str:
     message = str(getattr(exc, "msg", "")) or "Twilio rejected the call."
     code = getattr(exc, "code", "")
-    if code in {21219, 30007, 30023} or "not verified" in message.lower() or "trial" in message.lower():
+    lowered = message.lower()
+    if code in {21219, 30007, 30023} or "not verified" in lowered or "verified number" in lowered:
         return (
             f"Twilio trial restriction ({code}): the recipient must be a verified number in the sign-up country. "
-            "Verify this number in Twilio Console → Voice → Try out Voice, then retry."
+            "Add it in Twilio Console → Phone Numbers → Verified Caller IDs, then retry."
         )
-    if code in {20404, 20003} or "authenticate" in message.lower():
+    if "limited parameter access" in lowered or "disallowed parameters" in lowered:
+        return (
+            f"Twilio rejected a call parameter ({code}): {_redact(message)[:160]} "
+            "Check that status_callback_event uses initiated/ringing/answered/completed."
+        )
+    if code in {20404, 20003} or "authenticate" in lowered:
         return "Twilio rejected the credentials. Check TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN."
     return f"Twilio error ({code}): {_redact(message)[:220]}"
 

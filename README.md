@@ -206,7 +206,8 @@ Live Twilio delivery, live Calendly credentials, and live handoff destination we
 | 503 from `/call` naming `PUBLIC_BASE_URL` | Preflight failed. The exact reason is returned without secrets; fix the tunnel or set `SKIP_WEBHOOK_PREFLIGHT=true` only for local tests. |
 | 401 from `/call` | Send the `X-API-Token` header with the server's `CALL_API_TOKEN`. |
 | 403 on a Twilio callback | Signature mismatch or unknown per-call token. Confirm `TWILIO_AUTH_TOKEN`, the exact public URL, and that the call was started by this app so its fresh token is present. |
-| "unverified number" trial error | Verify the recipient in Twilio Console → Voice → Try out Voice, use the shown `from` number, and keep the destination in the sign-up country. |
+| "unverified number" trial error | Add the recipient in Twilio Console → Phone Numbers → Verified Caller IDs. Trial calls must stay in the sign-up country. |
+| "invalid or disallowed parameters" trial error | Use valid status events: `initiated`, `ringing`, `answered`, `completed`. The app now sends these; rebuild if you see this on an older image. |
 | Slow or silent replies | Keep `LLM_TIMEOUT_SECONDS` at 8; the offline KB fallback engages on timeout. |
 
 ---

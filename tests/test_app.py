@@ -156,6 +156,7 @@ def test_phone_call_happy_path(client, monkeypatch, auth_headers):
     assert bot_app.CALL_SESSIONS[SID]["webhook_token"] in kwargs["url"]
     assert kwargs["method"] == "POST"
     assert kwargs["status_callback"] == "https://tunnel.example.test/twilio/status"
+    assert kwargs["status_callback_event"] == ["initiated", "ringing", "answered", "completed"]
     assert SID in bot_app.CALL_SESSIONS
     assert bot_app.CALL_RECORDS[SID]["status"] == "queued"
 
@@ -223,6 +224,24 @@ def test_trial_restriction_error_is_actionable(client, monkeypatch, auth_headers
     assert response.status_code == 400
     assert "verified number" in response.json()["detail"]
     assert not bot_app.CALL_RECORDS
+
+
+def test_invalid_parameter_error_is_not_misreported_as_trial_verification(client, monkeypatch, auth_headers):
+    from twilio.base.exceptions import TwilioRestException
+
+    client_mock = MagicMock()
+    client_mock.calls.create.side_effect = TwilioRestException(
+        400,
+        "/Calls",
+        "Invalid or disallowed parameters provided - trial accounts have limited parameter access",
+        0,
+    )
+    monkeypatch.setattr(bot_app, "TwilioClient", MagicMock(return_value=client_mock))
+    response = client.post("/call", json={"to_number": "+15557654321"}, headers=auth_headers)
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "verified number" not in detail
+    assert "status_callback_event" in detail
 
 
 def test_rate_limit_blocks_abuse(client, env, monkeypatch, auth_headers):
