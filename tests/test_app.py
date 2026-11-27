@@ -1,391 +1,611 @@
+"""Comprehensive tests for the calling bot. External services are always mocked."""
+
+from __future__ import annotations
+
 import json
-import os
-import sys
-import tempfile
-import types
-import unittest
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 from xml.etree import ElementTree as ET
 
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+import pytest
+from fastapi.testclient import TestClient
 
-# Allow running tests on a host Python that relies on Docker for Twilio SDK
-try:
-    import twilio  # noqa: F401
-except ImportError:
-    twilio_mod = types.ModuleType("twilio")
-    base_mod = types.ModuleType("twilio.base")
-    exc_mod = types.ModuleType("twilio.base.exceptions")
-    rest_mod = types.ModuleType("twilio.rest")
-    twiml_mod = types.ModuleType("twilio.twiml")
-    voice_mod = types.ModuleType("twilio.twiml.voice_response")
+import app as bot_app
+import integrations
+import security
+from local_demo import fallback_reply, generate_llm_reply, sanitize_for_tts
+from prompts import build_greeting, build_system_prompt, load_knowledge_base
 
-    class TwilioRestException(Exception):
-        def __init__(self, status=400, uri="", msg="Twilio error", code=21219):
-            super().__init__(msg)
-            self.status = status
-            self.uri = uri
-            self.msg = msg
-            self.code = code
-
-    class _Client:
-        def __init__(self, *args, **kwargs):
-            self.calls = MagicMock()
-
-    class _Gather:
-        def __init__(self, **attrs):
-            self.attrs = attrs
-            self.says = []
-
-        def say(self, text, **attrs):
-            self.says.append((text, attrs))
-
-    class _VoiceResponse:
-        def __init__(self):
-            self.children = []
-
-        def append(self, node):
-            self.children.append(("gather", node))
-
-        def say(self, text, **attrs):
-            self.children.append(("say", text, attrs))
-
-        def hangup(self):
-            self.children.append(("hangup",))
-
-        def __str__(self):
-            root = ET.Element("Response")
-            for item in self.children:
-                if item[0] == "gather":
-                    node = item[1]
-                    g = ET.SubElement(
-                        root,
-                        "Gather",
-                        {k: str(v) for k, v in node.attrs.items()},
-                    )
-                    for txt, sattrs in node.says:
-                        s = ET.SubElement(g, "Say", {k: str(v) for k, v in sattrs.items()})
-                        s.text = txt
-                elif item[0] == "say":
-                    s = ET.SubElement(root, "Say", {k: str(v) for k, v in item[2].items()})
-                    s.text = item[1]
-                elif item[0] == "hangup":
-                    ET.SubElement(root, "Hangup")
-            return ET.tostring(root, encoding="unicode")
-
-    exc_mod.TwilioRestException = TwilioRestException
-    rest_mod.Client = _Client
-    voice_mod.Gather = _Gather
-    voice_mod.VoiceResponse = _VoiceResponse
-    sys.modules["twilio"] = twilio_mod
-    sys.modules["twilio.base"] = base_mod
-    sys.modules["twilio.base.exceptions"] = exc_mod
-    sys.modules["twilio.rest"] = rest_mod
-    sys.modules["twilio.twiml"] = twiml_mod
-    sys.modules["twilio.twiml.voice_response"] = voice_mod
-
-try:
-    import python_multipart  # noqa: F401
-except ImportError:
-    try:
-        import multipart  # noqa: F401
-    except ImportError:
-        class _QuerystringParser:
-            def __init__(self, callbacks):
-                self.callbacks = callbacks
-                self.buf = bytearray()
-
-            def write(self, data: bytes):
-                self.buf.extend(data)
-
-            def finalize(self):
-                raw = bytes(self.buf)
-                if raw:
-                    for pair in raw.split(b"&"):
-                        k, _, v = pair.partition(b"=")
-                        self.callbacks["on_field_start"]()
-                        self.callbacks["on_field_name"](k, 0, len(k))
-                        self.callbacks["on_field_data"](v, 0, len(v))
-                        self.callbacks["on_field_end"]()
-                self.callbacks["on_end"]()
-
-        mp_mod = types.ModuleType("multipart")
-        mp_mod.__version__ = "0.0.17"
-        mp_sub = types.ModuleType("multipart.multipart")
-        mp_sub.parse_options_header = lambda val: (
-            (val or "").split(";")[0].strip().lower().encode(),
-            {},
-        )
-        mp_sub.QuerystringParser = _QuerystringParser
-        mp_mod.QuerystringParser = _QuerystringParser
-        sys.modules["multipart"] = mp_mod
-        sys.modules["multipart.multipart"] = mp_sub
-
-from fastapi.testclient import TestClient  # noqa: E402
-import app as bot_app  # noqa: E402
-from local_demo import fallback_reply, generate_llm_reply, sanitize_for_tts  # noqa: E402
-from prompts import build_greeting, build_system_prompt, load_knowledge_base  # noqa: E402
+SID = "CA12345678901234567890123456789012"
 
 
-class TestZohoPeopleBot(unittest.TestCase):
-    def setUp(self):
-        self._tmp_dir = tempfile.TemporaryDirectory()
-        self._orig_data_dir = bot_app.DATA_DIR
-        self._orig_hist_path = bot_app.CALL_HISTORY_PATH
-        bot_app.DATA_DIR = Path(self._tmp_dir.name)
-        bot_app.CALL_HISTORY_PATH = bot_app.DATA_DIR / "call_history.json"
-        bot_app.CALL_SESSIONS.clear()
-        bot_app.CALL_RECORDS.clear()
-        bot_app.WEB_SESSIONS.clear()
-        self.client = TestClient(bot_app.app)
+def mock_twilio(monkeypatch, sid: str = SID):
+    call = SimpleNamespace(sid=sid, status="queued")
+    client = MagicMock()
+    client.calls.create.return_value = call
+    monkeypatch.setattr(bot_app, "TwilioClient", MagicMock(return_value=client))
+    return client
 
-    def tearDown(self):
-        bot_app.DATA_DIR = self._orig_data_dir
-        bot_app.CALL_HISTORY_PATH = self._orig_hist_path
-        self._tmp_dir.cleanup()
 
-    def test_qualification_extracts_bant_and_appointment(self):
-        qualification = bot_app.extract_qualification(
-            [
+def mock_llm(monkeypatch, replies):
+    client = MagicMock()
+    responses = []
+    for text in replies:
+        completion = MagicMock()
+        completion.choices = [MagicMock(message=MagicMock(content=text))]
+        responses.append(completion)
+    client.chat.completions.create.side_effect = responses
+    monkeypatch.setattr(bot_app, "get_llm_client", lambda: (client, "test-model"))
+    return client
+
+
+def twiml(response: TestClient | object):
+    xml = ET.fromstring(response.text)
+    assert xml.tag == "Response"
+    return xml
+
+
+# --- Health, prompts and qualification -------------------------------------
+
+
+def test_health_and_pages(client):
+    for route in ("/", "/web", "/web/calls", "/health", "/webhook-check"):
+        response = client.get(route)
+        assert response.status_code == 200, route
+    data = client.get("/health").json()
+    assert data["status"] == "ok"
+    assert data["console_auth_required"] is True
+    assert data["twilio_signature_validation"] is False  # tests disable it explicitly
+    assert "public_base_url" not in data  # never leak the tunnel URL
+    assert client.get("/webhook-check").text == "ok"
+
+
+def test_prompt_discloses_ai_and_uses_kb(client):
+    kb = load_knowledge_base()
+    assert kb["product_name"] == "Zoho People"
+    assert "Interloop Consulting" in kb["interloop"]["name"]
+    prompt = build_system_prompt("Alex", "Acme", team_size="51-200 employees")
+    assert "AI sales assistant" in prompt
+    assert "Interloop Consulting" in prompt
+    assert "Zoho People" in prompt
+    assert "51-200 employees" in prompt
+    assert "Essential HR" in prompt
+    greeting = build_greeting("Alex", "Acme", primary_interest="Attendance")
+    assert "AI sales assistant" in greeting
+    assert "Interloop Consulting" in greeting
+    assert "Alex" in greeting
+
+
+def test_sanitize_and_fallback_are_kb_consistent(client):
+    assert sanitize_for_tts("**Hello** _world_! [END_CALL]") == "Hello world!"
+    assert "48 rupees" in fallback_reply("What is the pricing per user?")
+    assert "Zoho Payroll" in fallback_reply("Does it include payroll and PF?")
+    assert "Learning Management System" in fallback_reply("Do you have an LMS?")
+    assert "HR Help Desk" in fallback_reply("How do employees raise HR tickets?")
+    assert "[END_CALL]" in fallback_reply("Thanks, bye!")
+    assert "GreytHR" not in fallback_reply("Which integrations do you have?")
+
+
+def test_qualification_extracts_bant_and_appointment(client):
+    qualification = bot_app.extract_qualification(
+        [
+            {
+                "role": "user",
+                "text": (
+                    "We have 80 employees. Our budget is around Rs 5 lakh. "
+                    "I make the final decision. We need this by next quarter. "
+                    "Let's meet Thursday at 3 pm. alex@example.com"
+                ),
+            }
+        ]
+    )
+    assert qualification["team_size"] == "80"
+    assert "5 lakh" in qualification["budget"]
+    assert qualification["authority"] == "Decision maker"
+    assert qualification["timeline"] == "next quarter"
+    assert "Thursday" in qualification["appointment"]
+    assert qualification["email"] == "alex@example.com"
+    assert bot_app.extract_qualification([{"role": "user", "text": "I decide."}])["authority"] == "Decision maker"
+
+
+def test_llm_timeout_is_below_twilio_deadline(client, env):
+    env(LLM_TIMEOUT_SECONDS="99")
+    assert bot_app.llm_timeout_seconds() == 12.0
+    env(LLM_TIMEOUT_SECONDS="3")
+    assert bot_app.llm_timeout_seconds() == 3.0
+
+
+def test_generate_llm_reply_provider_extras_and_retry(client, monkeypatch):
+    completion = MagicMock()
+    completion.choices = [MagicMock(message=MagicMock(content="OpenRouter reply"))]
+    llm = MagicMock()
+    llm.chat.completions.create.return_value = completion
+    monkeypatch.setenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    assert generate_llm_reply(llm, "nvidia/nemotron-3.5-lightning:free", [{"role": "user", "content": "hi"}]) == "OpenRouter reply"
+    assert llm.chat.completions.create.call_args.kwargs["extra_body"] == {"reasoning": {"effort": "none"}}
+
+    llm.chat.completions.create.side_effect = [ValueError("unsupported"), completion]
+    monkeypatch.setenv("LLM_BASE_URL", "")
+    assert generate_llm_reply(llm, "gpt-oss-20b", [{"role": "user", "content": "hi"}]) == "OpenRouter reply"
+    assert llm.chat.completions.create.call_count == 3
+
+
+# --- Outbound calling, auth and preflight -----------------------------------
+
+
+def test_phone_call_happy_path(client, monkeypatch, auth_headers):
+    twilio = mock_twilio(monkeypatch)
+    response = client.post(
+        "/call",
+        json={
+            "to_number": "+1 555-765-4321",
+            "lead_name": "Alex",
+            "company_name": "Acme",
+            "primary_interest": "Performance & OKRs",
+        },
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["call_sid"] == SID
+    assert body["to"] == "+15557654321"
+    kwargs = twilio.calls.create.call_args.kwargs
+    assert kwargs["to"] == "+15557654321"
+    assert kwargs["from_"] == "+15551234567"
+    assert kwargs["url"].startswith("https://tunnel.example.test/twilio/voice?token=")
+    assert bot_app.CALL_SESSIONS[SID]["webhook_token"] in kwargs["url"]
+    assert kwargs["method"] == "POST"
+    assert kwargs["status_callback"] == "https://tunnel.example.test/twilio/status"
+    assert SID in bot_app.CALL_SESSIONS
+    assert bot_app.CALL_RECORDS[SID]["status"] == "queued"
+
+
+def test_call_endpoints_require_token(client, env, monkeypatch, auth_headers):
+    mock_twilio(monkeypatch)
+    payload = {"to_number": "+15557654321"}
+    assert client.post("/call", json=payload).status_code == 401
+    assert client.get("/web/calls/status").status_code == 401
+    env(CALL_API_TOKEN="")
+    response = client.post("/call", json=payload, headers=auth_headers)
+    assert response.status_code == 503
+    assert "CALL_API_TOKEN" in response.json()["detail"]
+
+
+def test_invalid_phone_rejected(client, auth_headers):
+    response = client.post("/call", json={"to_number": "9876543210"}, headers=auth_headers)
+    assert response.status_code == 400
+    assert "E.164" in response.json()["detail"]
+
+
+def test_duplicate_call_prevented(client, monkeypatch, auth_headers):
+    mock_twilio(monkeypatch)
+    payload = {"to_number": "+15557654321"}
+    assert client.post("/call", json=payload, headers=auth_headers).status_code == 200
+    second = client.post("/call", json=payload, headers=auth_headers)
+    assert second.status_code == 409
+
+
+def test_batch_call_reports_individual_errors(client, monkeypatch, auth_headers):
+    mock_twilio(monkeypatch)
+    response = client.post(
+        "/web/calls",
+        json={"contacts": [{"to_number": "+15557654321"}, {"to_number": "bad"}]},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    calls = response.json()["calls"]
+    assert calls[0]["call_sid"] == SID
+    assert calls[1]["status"] == "error"
+
+
+def test_preflight_reports_actionable_dns_error(client, env, monkeypatch, auth_headers):
+    env(SKIP_WEBHOOK_PREFLIGHT="false", PUBLIC_BASE_URL="https://example.com")
+    mock_twilio(monkeypatch)
+    monkeypatch.setattr(security, "validate_public_url", lambda url, **kwargs: url)
+
+    def fail(*args, **kwargs):
+        raise OSError("Could not resolve host: example.com")
+
+    monkeypatch.setattr(security, "fetch_url", fail)
+    response = client.post("/call", json={"to_number": "+15557654321"}, headers=auth_headers)
+    assert response.status_code == 503
+    assert "Restart the tunnel" in response.json()["detail"]
+    assert "example.com" in response.json()["detail"]
+
+
+def test_trial_restriction_error_is_actionable(client, monkeypatch, auth_headers):
+    from twilio.base.exceptions import TwilioRestException
+
+    client_mock = MagicMock()
+    client_mock.calls.create.side_effect = TwilioRestException(400, "/Calls", "unverified number", 21219)
+    monkeypatch.setattr(bot_app, "TwilioClient", MagicMock(return_value=client_mock))
+    response = client.post("/call", json={"to_number": "+15557654321"}, headers=auth_headers)
+    assert response.status_code == 400
+    assert "verified number" in response.json()["detail"]
+    assert not bot_app.CALL_RECORDS
+
+
+def test_rate_limit_blocks_abuse(client, env, monkeypatch, auth_headers):
+    env(RATE_LIMIT_ENABLED="true")
+    monkeypatch.setattr(bot_app, "place_outbound_call", lambda payload: {"ok": True})
+    for _ in range(10):
+        assert client.post("/call", json={"to_number": "+15557654321"}, headers=auth_headers).status_code == 200
+    assert client.post("/call", json={"to_number": "+15557654321"}, headers=auth_headers).status_code == 429
+
+
+# --- Twilio webhooks ---------------------------------------------------------
+
+
+def test_voice_webhook_returns_valid_twiml(client, monkeypatch, auth_headers):
+    mock_twilio(monkeypatch)
+    client.post("/call", json={"to_number": "+15557654321", "lead_name": "Alex"}, headers=auth_headers)
+    response = client.post("/twilio/voice", data={"CallSid": SID, "From": "+15557654321"})
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/xml")
+    root = twiml(response)
+    gather = root.find("Gather")
+    assert gather is not None
+    assert gather.attrib["action"].startswith("https://tunnel.example.test/twilio/respond?token=")
+    assert bot_app.CALL_SESSIONS[SID]["webhook_token"] in gather.attrib["action"]
+    assert gather.attrib["input"] == "speech"
+    assert "AI sales assistant" in gather.find("Say").text
+    assert "Alex" in gather.find("Say").text
+
+
+def test_multi_turn_conversation_with_mocked_llm(client, monkeypatch):
+    mock_llm(monkeypatch, ["Got it, 80 employees. Which area is the priority?", "Thanks, bye! [END_CALL]"])
+    client.post("/twilio/voice", data={"CallSid": SID})
+    first = client.post("/twilio/respond", data={"CallSid": SID, "SpeechResult": "We have 80 employees"})
+    assert "80 employees" in first.text
+    assert "<Gather" in first.text
+    second = client.post("/twilio/respond", data={"CallSid": SID, "SpeechResult": "Thanks, goodbye"})
+    assert "<Hangup" in second.text
+    assert SID not in bot_app.CALL_SESSIONS
+
+
+def test_silence_and_timeout_are_bounded(client):
+    client.post("/twilio/voice", data={"CallSid": SID})
+    first = client.post("/twilio/respond", data={"CallSid": SID, "SpeechResult": ""})
+    assert "repeat" in first.text.lower()
+    second = client.post("/twilio/respond", data={"CallSid": SID, "SpeechResult": ""})
+    assert "<Hangup" in twiml(second).tag or "<Hangup" in second.text
+    assert SID not in bot_app.CALL_SESSIONS
+
+
+def test_unknown_session_and_turn_cap_hang_up(client, monkeypatch):
+    unknown = client.post("/twilio/respond", data={"CallSid": "CAunknown", "SpeechResult": "hello"})
+    assert "<Hangup" in unknown.text
+
+    client.post("/twilio/voice", data={"CallSid": SID})
+    bot_app.CALL_SESSIONS[SID]["turn_count"] = bot_app.MAX_TURNS
+    monkeypatch.setattr(bot_app, "fallback_reply", lambda text: "Wrapping up now. [END_CALL]")
+    capped = client.post("/twilio/respond", data={"CallSid": SID, "SpeechResult": "hello"})
+    assert "<Hangup" in capped.text
+
+
+def test_live_llm_failure_falls_back(client, monkeypatch):
+    def fail():
+        raise TimeoutError("LLM timed out")
+
+    monkeypatch.setattr(bot_app, "get_llm_client", fail)
+    client.post("/twilio/voice", data={"CallSid": SID})
+    response = client.post("/twilio/respond", data={"CallSid": SID, "SpeechResult": "What does it cost?"})
+    assert "Zoho People" in response.text
+    assert "<Gather" in response.text
+
+
+def test_twilio_signature_validation(client, env):
+    from twilio.request_validator import RequestValidator
+
+    env(TWILIO_VERIFY_SIGNATURES="true")
+    params = {"CallSid": SID, "SpeechResult": "hello"}
+    url = "http://testserver/twilio/respond"
+    signature = RequestValidator("test-twilio-token").compute_signature(url, params)
+    valid = client.post("/twilio/respond", data=params, headers={"X-Twilio-Signature": signature})
+    assert valid.status_code == 200
+    invalid = client.post("/twilio/respond", data=params, headers={"X-Twilio-Signature": "bad-signature"})
+    assert invalid.status_code == 403
+    missing = client.post("/twilio/respond", data=params)
+    assert missing.status_code == 403
+
+
+def test_status_callback_finalizes_and_exports(client, monkeypatch, auth_headers):
+    mock_twilio(monkeypatch)
+    export = MagicMock()
+    monkeypatch.setattr(integrations, "post_lead_webhook", export)
+    client.post("/call", json={"to_number": "+15557654321"}, headers=auth_headers)
+    client.post("/twilio/voice", data={"CallSid": SID})
+    response = client.post(
+        "/twilio/status",
+        data={"CallSid": SID, "CallStatus": "completed", "CallDuration": "42"},
+    )
+    assert response.json()["received"] is True
+    assert bot_app.CALL_RECORDS[SID]["status"] == "completed"
+    assert bot_app.CALL_RECORDS[SID]["duration"] == "42"
+    assert SID not in bot_app.CALL_SESSIONS
+    export.assert_called_once()
+
+
+def test_busy_status_does_not_export_lead(client, monkeypatch, auth_headers):
+    mock_twilio(monkeypatch)
+    export = MagicMock()
+    monkeypatch.setattr(integrations, "post_lead_webhook", export)
+    client.post("/call", json={"to_number": "+15557654321"}, headers=auth_headers)
+    client.post("/twilio/status", data={"CallSid": SID, "CallStatus": "busy"})
+    assert bot_app.CALL_RECORDS[SID]["status"] == "busy"
+    export.assert_not_called()
+
+
+def test_handoff_requires_explicit_confirmation(client, monkeypatch, env):
+    env(HANDOFF_PHONE_NUMBER="+15559998888")
+    client.post("/twilio/voice", data={"CallSid": SID})
+    request = client.post("/twilio/respond", data={"CallSid": SID, "SpeechResult": "Can I speak to a person?"})
+    assert "confirm" in request.text.lower()
+    assert "<Dial" not in request.text
+    confirmed = client.post("/twilio/respond", data={"CallSid": SID, "SpeechResult": "Yes please"})
+    root = twiml(confirmed)
+    dial = root.find("Dial")
+    assert dial is not None
+    assert dial.text == "+15559998888"
+    assert bot_app.CALL_RECORDS[SID]["next_step"] == "Transferred to human"
+
+
+def test_handoff_without_config_offers_callback(client):
+    client.post("/twilio/voice", data={"CallSid": SID})
+    response = client.post("/twilio/respond", data={"CallSid": SID, "SpeechResult": "Transfer me to a human"})
+    assert "call you back" in response.text
+    assert "<Dial" not in response.text
+
+
+# --- Browser demo ------------------------------------------------------------
+
+
+def test_web_demo_end_to_end_and_persistence(client, monkeypatch):
+    monkeypatch.setattr(bot_app, "get_llm_client", lambda: (_ for _ in ()).throw(RuntimeError("no key")))
+    start = client.post("/leads", json={"lead_name": "Alex", "channel": "browser"})
+    assert start.status_code == 200
+    session_id = start.json()["session_id"]
+    assert "AI sales assistant" in start.json()["greeting"]
+
+    first = client.post("/web/turn", json={"session_id": session_id, "message": "We have 120 employees and want pricing"})
+    assert first.status_code == 200
+    assert "Pricing & Trial" in first.json()["qualification"]["topics"]
+    assert first.json()["end_call"] is False
+
+    ended = client.post("/web/turn", json={"session_id": session_id, "message": "Thanks, goodbye"})
+    assert ended.json()["end_call"] is True
+    assert session_id not in bot_app.WEB_SESSIONS
+    saved = json.loads(bot_app.CALL_HISTORY_PATH.read_text())
+    assert any(rec["call_sid"] == session_id and rec["status"] == "completed" for rec in saved)
+
+
+def test_web_end_exports_once(client, monkeypatch):
+    export = MagicMock()
+    monkeypatch.setattr(integrations, "post_lead_webhook", export)
+    session_id = client.post("/web/start", json={"lead_name": "Alex"}).json()["session_id"]
+    client.post("/web/end", json={"session_id": session_id})
+    client.post("/web/end", json={"session_id": session_id})
+    export.assert_called_once()
+    assert bot_app.CALL_RECORDS[session_id]["status"] == "completed"
+
+
+def test_web_turn_rejects_unknown_session(client):
+    assert client.post("/web/turn", json={"session_id": "missing", "message": "hi"}).status_code == 404
+
+
+# --- Calendly ----------------------------------------------------------------
+
+
+def test_calendly_offer_requires_confirmation_before_booking(client, monkeypatch, env):
+    env(
+        CALENDLY_ACCESS_TOKEN="pat-test",
+        CALENDLY_EVENT_TYPE_URI="https://api.calendly.com/event_types/abc123",
+    )
+    slots = [
+        {"start_time": "2030-01-02T10:00:00Z", "label": "Wednesday 03:30 PM IST", "scheduling_url": "https://calendly.com/x"},
+        {"start_time": "2030-01-03T10:00:00Z", "label": "Thursday 03:30 PM IST", "scheduling_url": "https://calendly.com/y"},
+    ]
+    calls = []
+
+    def fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if method == "GET":
+            return {
+                "collection": [
+                    {
+                        "status": "available",
+                        "invitees_remaining": 1,
+                        "start_time": slot["start_time"],
+                        "scheduling_url": slot["scheduling_url"],
+                    }
+                    for slot in slots
+                ]
+            }
+        return {"resource": {"uri": "https://api.calendly.com/invitees/1", "start_time": "2030-01-02T10:00:00Z"}}
+
+    monkeypatch.setattr(integrations, "_calendly_request", fake_request)
+    session_id = client.post("/web/start", json={"lead_name": "Alex", "email": "alex@example.com"}).json()["session_id"]
+    offer = client.post("/web/turn", json={"session_id": session_id, "message": "I would like to book a demo"}).json()
+    assert "Wednesday" in offer["reply"]
+    assert "option one" in offer["reply"]
+
+    selection = client.post("/web/turn", json={"session_id": session_id, "message": "First one"}).json()
+    assert "confirm" in selection["reply"].lower()
+    assert not any(method == "POST" for method, _, _ in calls)
+
+    booked = client.post("/web/turn", json={"session_id": session_id, "message": "Yes, book it"}).json()
+    assert "booked" in booked["reply"].lower()
+    assert booked["qualification"]["next_step"] == "Demo booked via Calendly"
+    assert any(method == "POST" for method, _, _ in calls)
+
+
+def test_calendly_failure_never_claims_success(client, monkeypatch, env):
+    env(CALENDLY_ACCESS_TOKEN="pat-test", CALENDLY_EVENT_TYPE_URI="https://api.calendly.com/event_types/abc123")
+    monkeypatch.setattr(
+        integrations,
+        "_calendly_request",
+        MagicMock(side_effect=integrations.IntegrationError("Calendly is unavailable")),
+    )
+    session_id = client.post("/web/start", json={"lead_name": "Alex", "email": "alex@example.com"}).json()["session_id"]
+    result = client.post("/web/turn", json={"session_id": session_id, "message": "Book a demo please"}).json()
+    assert "booked" not in result["reply"].lower()
+
+
+def test_calendly_requires_configuration(client, env):
+    env(CALENDLY_ACCESS_TOKEN="", CALENDLY_EVENT_TYPE_URI="")
+    assert integrations.calendly_configured() is False
+    with pytest.raises(integrations.IntegrationError):
+        integrations.available_slots()
+
+
+# --- Research and SSRF -------------------------------------------------------
+
+
+def test_research_fetch_cache_and_fallback(monkeypatch, env):
+    env(RESEARCH_CACHE_TTL_SECONDS="3600")
+    integrations._RESEARCH_CACHE.update({"data": None, "expires_at": 0, "fetched_at": ""})
+    pages = {
+        integrations.FEATURES_URL: "Zoho People features attendance leave onboarding",
+        integrations.PRICING_URL: "30 day free trial plans Essential HR Professional",
+        integrations.INTERLOOP_URL: "Interloop Consulting Zoho Premium Partner India UAE",
+    }
+    monkeypatch.setattr(integrations, "_fetch_text", lambda url: pages[url])
+    data = integrations.refresh_research()
+    assert data and "Zoho Premium Partner" in data["interloop"]
+    assert integrations.get_research()["zoho_features"].startswith("Zoho People features")
+
+    prompt = build_system_prompt("Alex", "Acme", live_context=data)
+    assert "Zoho Premium Partner" in prompt
+
+    monkeypatch.setattr(integrations, "_fetch_text", MagicMock(side_effect=OSError("offline")))
+    integrations._RESEARCH_CACHE.update({"data": None, "expires_at": 0, "fetched_at": ""})
+    assert integrations.refresh_research() is None
+
+
+def test_ssrf_url_validation(monkeypatch):
+    with pytest.raises(security.UnsafeURLError):
+        security.validate_public_url("http://example.com/anything")
+    with pytest.raises(security.UnsafeURLError):
+        security.validate_public_url("https://user:password@example.com/")
+    with pytest.raises(security.UnsafeURLError):
+        security.validate_public_url("https://127.0.0.1/admin")
+    with pytest.raises(security.UnsafeURLError):
+        security.validate_public_url("https://192.168.1.10/")
+
+
+def test_phone_normalization_and_masking():
+    assert security.normalize_phone_number("+91 (98765) 43210") == "+919876543210"
+    with pytest.raises(ValueError):
+        security.normalize_phone_number("+0123456789")
+    assert security.mask_phone("+15557654321").endswith("4321")
+
+
+# --- Additional integration and fallback coverage --------------------------
+
+
+def test_unsigned_twilio_webhooks_use_per_call_token(client, env, monkeypatch):
+    env(TWILIO_VERIFY_SIGNATURES="true")
+    mock_llm(monkeypatch, ["Hello Alex, what brings you here today?"])
+    session = bot_app._new_session("Alex", "Acme", {})
+    token = session["webhook_token"]
+    bot_app.CALL_SESSIONS[SID] = session
+
+    voice = client.post(f"/twilio/voice?token={token}", data={"CallSid": SID})
+    assert voice.status_code == 200
+    assert token in voice.text
+
+    reply = client.post(
+        f"/twilio/respond?token={token}",
+        data={"CallSid": SID, "SpeechResult": "I am interested"},
+    )
+    assert reply.status_code == 200
+    assert token in reply.text
+
+    denied = client.post("/twilio/voice?token=wrong-token", data={"CallSid": SID})
+    assert denied.status_code == 403
+
+
+def test_calendly_api_payloads_and_auth(monkeypatch, env):
+    env(
+        CALENDLY_ACCESS_TOKEN="pat-secret",
+        CALENDLY_EVENT_TYPE_URI="https://api.calendly.com/event_types/abc123",
+    )
+    calls = []
+    slot_response = json.dumps(
+        {
+            "collection": [
                 {
-                    "role": "user",
-                    "text": (
-                        "We have 80 employees. Our budget is around Rs 5 lakh. "
-                        "I make the final decision. We need this by next quarter. "
-                        "Let's meet Thursday at 3 pm."
-                    ),
+                    "status": "available",
+                    "invitees_remaining": 2,
+                    "start_time": "2030-01-02T10:00:00Z",
+                    "scheduling_url": "https://calendly.com/demo/1",
                 }
             ]
-        )
-        for key in ("team_size", "topics", "email", "next_step", "turns",
-                    "budget", "authority", "timeline", "appointment"):
-            self.assertIn(key, qualification)
-        self.assertEqual(qualification["team_size"], "80")
-        self.assertIn("5 lakh", qualification["budget"])
-        self.assertEqual(qualification["authority"], "Decision maker")
-        self.assertEqual(qualification["timeline"], "next quarter")
-        self.assertIn("Thursday", qualification["appointment"])
-        self.assertEqual(
-            bot_app.extract_qualification([{"role": "user", "text": "I decide."}])["authority"],
-            "Decision maker",
-        )
-
-    def test_webhook_export_posts_once_and_tolerates_failure(self):
-        with patch.dict(bot_app.os.environ, {"SALES_WEBHOOK_URL": "https://example.test/hook"}):
-            with patch.object(bot_app.urllib.request, "urlopen") as urlopen:
-                urlopen.return_value.__enter__.return_value.read.return_value = b"ok"
-                record = {"call_sid": "CAexport"}
-                bot_app.export_lead_to_webhook(record)
-                bot_app.export_lead_to_webhook(record)
-                self.assertEqual(urlopen.call_count, 1)
-                self.assertTrue(record["exported"])
-
-            with patch.object(
-                bot_app.urllib.request,
-                "urlopen",
-                side_effect=OSError("receiver offline"),
-            ):
-                bot_app.export_lead_to_webhook({"call_sid": "CAfailed"})
-
-    def test_knowledge_base_and_prompt_include_pricing_and_context(self):
-        kb = load_knowledge_base()
-        self.assertEqual(kb["product_name"], "Zoho People")
-        self.assertGreaterEqual(len(kb["modules"]), 6)
-        self.assertIn("pricing_india", kb)
-        prompt = build_system_prompt(
-            lead_name="Alex",
-            company_name="Acme",
-            team_size="51-200 employees",
-            primary_interest="Attendance & Shift Management",
-        )
-        self.assertIn("Aria", prompt)
-        self.assertIn("Alex", prompt)
-        self.assertIn("Acme", prompt)
-        self.assertIn("51-200 employees", prompt)
-        self.assertIn("Essential HR", prompt)
-
-        greeting = build_greeting("Alex", "Acme", primary_interest="Attendance")
-        self.assertIn("Alex", greeting)
-        self.assertIn("Attendance", greeting)
-
-    def test_sanitize_and_fallback_coverage(self):
-        self.assertEqual(sanitize_for_tts("**Hello** _world_! [END_CALL]"), "Hello world!")
-        self.assertIn("48 rupees", fallback_reply("What is the pricing per user?"))
-        self.assertIn("Zoho Payroll", fallback_reply("Does it include payroll and PF?"))
-        self.assertIn("Learning Management System", fallback_reply("Do you have an LMS for training?"))
-        self.assertIn("HR Help Desk", fallback_reply("How do employees raise HR tickets?"))
-        self.assertIn("120", fallback_reply("We have 120 employees"))
-        self.assertIn("[END_CALL]", fallback_reply("Thanks, bye!"))
-
-    def test_pages_and_health_endpoints(self):
-        for route in ("/", "/web", "/web/calls"):
-            res = self.client.get(route)
-            self.assertEqual(res.status_code, 200, f"GET {route} failed")
-
-        health = self.client.get("/health")
-        self.assertEqual(health.status_code, 200)
-        data = health.json()
-        self.assertEqual(data["status"], "ok")
-        self.assertIn("llm_configured", data)
-        self.assertIn("ready_for_phone_calls", data)
-
-    def test_web_voice_flow_end_to_end_offline_fallback(self):
-        with patch.object(bot_app, "get_llm_client", side_effect=RuntimeError("no key")):
-            start = self.client.post(
-                "/leads",
-                json={
-                    "lead_name": "Alex",
-                    "company_name": "Acme",
-                    "team_size": "51-200 employees",
-                    "primary_interest": "Attendance & Shift Management",
-                    "channel": "browser",
-                },
-            )
-            self.assertEqual(start.status_code, 200)
-            session_id = start.json()["session_id"]
-            self.assertIn("Attendance", start.json()["greeting"])
-
-            turn1 = self.client.post(
-                "/web/turn",
-                json={"session_id": session_id, "message": "We have 120 employees and want pricing and a demo"},
-            )
-            self.assertEqual(turn1.status_code, 200)
-            body1 = turn1.json()
-            self.assertFalse(body1["end_call"])
-            self.assertEqual(body1["qualification"]["team_size"], "51-200 employees")
-            self.assertIn("Pricing & Trial", body1["qualification"]["topics"])
-
-            turn2 = self.client.post(
-                "/web/turn",
-                json={"session_id": session_id, "message": "Thanks, goodbye"},
-            )
-            self.assertEqual(turn2.status_code, 200)
-            self.assertTrue(turn2.json()["end_call"])
-            self.assertNotIn(session_id, bot_app.WEB_SESSIONS)
-
-    def test_outbound_twilio_call_and_voice_webhooks(self):
-        mock_call = MagicMock()
-        mock_call.sid = "CA1234567890"
-        mock_call.status = "queued"
-
-        mock_twilio_instance = MagicMock()
-        mock_twilio_instance.calls.create.return_value = mock_call
-
-        env = {
-            "TWILIO_ACCOUNT_SID": "ACtest",
-            "TWILIO_AUTH_TOKEN": "toktest",
-            "TWILIO_PHONE_NUMBER": "+15551234567",
-            "PUBLIC_BASE_URL": "https://example.trycloudflare.com",
         }
-        with patch.dict(os.environ, env, clear=False), patch.object(
-            bot_app, "TwilioClient", return_value=mock_twilio_instance
-        ):
-            res = self.client.post(
-                "/call",
-                json={
-                    "to_number": "+1 555-765-4321",
-                    "lead_name": "Alex",
-                    "company_name": "Acme",
-                    "primary_interest": "Performance & OKRs",
-                },
-            )
-            self.assertEqual(res.status_code, 200)
-            self.assertEqual(res.json()["call_sid"], "CA1234567890")
-            self.assertEqual(res.json()["to"], "+15557654321")
+    ).encode()
+    booking_response = json.dumps(
+        {"resource": {"uri": "https://api.calendly.com/invitees/1", "start_time": "2030-01-02T10:00:00Z"}}
+    ).encode()
 
-        voice_res = self.client.post("/twilio/voice", data={"CallSid": "CA1234567890"})
-        self.assertEqual(voice_res.status_code, 200)
-        self.assertIn("<Gather", voice_res.text)
-        self.assertIn("Alex", voice_res.text)
+    def fake_fetch(url, **kwargs):
+        calls.append((url, kwargs))
+        return slot_response if kwargs["method"] == "GET" else booking_response
 
-        # First silence asks to repeat; second silence hangs up gracefully
-        s1 = self.client.post("/twilio/respond", data={"CallSid": "CA1234567890", "SpeechResult": ""})
-        self.assertIn("repeat", s1.text.lower())
-        s2 = self.client.post("/twilio/respond", data={"CallSid": "CA1234567890", "SpeechResult": ""})
-        self.assertIn("<Hangup", s2.text)
+    monkeypatch.setattr(integrations, "fetch_url", fake_fetch)
+    slots = integrations.available_slots(days=3, limit=1)
+    assert slots[0]["start_time"] == "2030-01-02T10:00:00Z"
+    assert "event_type=https%3A%2F%2Fapi.calendly.com%2Fevent_types%2Fabc123" in calls[0][0]
+    assert calls[0][1]["headers"]["Authorization"] == "Bearer pat-secret"
 
-    def test_twilio_respond_with_mocked_llm_and_end_call(self):
-        bot_app.CALL_SESSIONS["CA_LLM"] = {
-            "lead_name": "Alex",
-            "company_name": "Acme",
-            "lead_meta": {},
-            "silence_count": 0,
-            "history": [{"role": "system", "content": "test"}],
-        }
-        bot_app.CALL_RECORDS["CA_LLM"] = {
-            "call_sid": "CA_LLM",
-            "channel": "phone",
-            "to_number": "+15557654321",
-            "lead_name": "Alex",
-            "company_name": "Acme",
-            "status": "in-progress",
-            "duration": "",
-            "transcript": [],
-            "qualification": {},
-        }
-        mock_completion = MagicMock()
-        mock_completion.choices = [
-            MagicMock(message=MagicMock(content="**Great**, I'll book your demo for Friday! [END_CALL]"))
-        ]
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_completion
-
-        with patch.object(bot_app, "get_llm_client", return_value=(mock_client, "openai/gpt-oss-20b")):
-            resp = self.client.post(
-                "/twilio/respond",
-                data={"CallSid": "CA_LLM", "SpeechResult": "Book the demo for Friday"},
-            )
-            self.assertEqual(resp.status_code, 200)
-            self.assertIn("Great, I'll book your demo for Friday!", resp.text)
-            self.assertNotIn("**", resp.text)
-            self.assertIn("<Hangup", resp.text)
-            self.assertNotIn("CA_LLM", bot_app.CALL_SESSIONS)
-
-    def test_generate_llm_reply_disables_openrouter_reasoning(self):
-        mock_completion = MagicMock()
-        mock_completion.choices = [MagicMock(message=MagicMock(content="OpenRouter reply"))]
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_completion
-        with patch.dict(os.environ, {"LLM_BASE_URL": "https://openrouter.ai/api/v1"}):
-            out = generate_llm_reply(
-                mock_client,
-                "nvidia/nemotron-3.5-lightning:free",
-                [{"role": "user", "content": "hi"}],
-            )
-        self.assertEqual(out, "OpenRouter reply")
-        kwargs = mock_client.chat.completions.create.call_args.kwargs
-        self.assertEqual(kwargs["extra_body"], {"reasoning": {"effort": "none"}})
-
-    def test_generate_llm_reply_retries_without_reasoning_effort(self):
-        mock_completion = MagicMock()
-        mock_completion.choices = [MagicMock(message=MagicMock(content="Clean reply"))]
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.side_effect = [
-            ValueError("unsupported extra_body"),
-            mock_completion,
-        ]
-        out = generate_llm_reply(mock_client, "openai/gpt-oss-20b", [{"role": "user", "content": "hi"}])
-        self.assertEqual(out, "Clean reply")
-        self.assertEqual(mock_client.chat.completions.create.call_count, 2)
-
-    def test_invalid_phone_number_rejected(self):
-        env = {
-            "TWILIO_ACCOUNT_SID": "ACtest",
-            "TWILIO_AUTH_TOKEN": "toktest",
-            "TWILIO_PHONE_NUMBER": "+15551234567",
-            "PUBLIC_BASE_URL": "https://example.trycloudflare.com",
-        }
-        with patch.dict(os.environ, env, clear=False):
-            res = self.client.post(
-                "/call",
-                json={"to_number": "9876543210", "lead_name": "Alex"},
-            )
-            self.assertEqual(res.status_code, 400)
-            self.assertIn("E.164", res.json()["detail"])
+    booking = integrations.book_slot(
+        start_time="2030-01-02T10:00:00Z",
+        lead_name="Alex",
+        email="alex@example.com",
+    )
+    assert booking["uri"].endswith("/invitees/1")
+    assert calls[1][1]["method"] == "POST"
+    payload = json.loads(calls[1][1]["body"].decode())
+    assert payload["invitee"]["email"] == "alex@example.com"
+    assert all("pat-secret" not in url and b"pat-secret" not in (kwargs.get("body") or b"") for url, kwargs in calls)
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_lead_export_requires_https_and_never_raises(monkeypatch, env):
+    env(SALES_WEBHOOK_URL="http://internal.example/hook", ALLOW_PRIVATE_WEBHOOK="false")
+    fetch = MagicMock(side_effect=AssertionError("should not be called"))
+    monkeypatch.setattr(integrations, "fetch_url", fetch)
+    integrations.post_lead_webhook({"call_sid": SID})
+    fetch.assert_not_called()
+
+    env(SALES_WEBHOOK_URL="https://sales.example/hook")
+    fetch.side_effect = OSError("offline")
+    integrations.post_lead_webhook({"call_sid": SID})  # must swallow errors
+
+
+def test_fallback_covers_all_core_topics():
+    cases = {
+        "What does attendance cost?": "48 rupees",
+        "Does it handle payroll?": "Zoho Payroll",
+        "We need attendance and shifts": "geo-fenced",
+        "We hire 20 people": "Zoho Recruit",
+        "Our performance reviews are manual": "360-degree appraisals",
+        "Do you have an LMS?": "Learning Management System",
+        "How do tickets work?": "HR Help Desk",
+        "Can I speak to a human?": "Interloop Consulting",
+        "I want a demo": "What email address",
+        "We are a team of 3": "Free plan covers up to 5 users",
+        "We have 700 employees": "Enterprise pricing",
+    }
+    for question, expected in cases.items():
+        assert expected in fallback_reply(question), question
+
+
+def test_preflight_success_probes_public_webhook(client, env, monkeypatch, auth_headers):
+    env(SKIP_WEBHOOK_PREFLIGHT="false")
+    mock_twilio(monkeypatch)
+    probe = MagicMock(return_value=b"ok")
+    monkeypatch.setattr(security, "fetch_url", probe)
+    monkeypatch.setattr(security, "validate_public_url", lambda url, **kwargs: url)
+
+    response = client.post("/call", json={"to_number": "+15557654321"}, headers=auth_headers)
+    assert response.status_code == 200
+    assert any(call.args[0] == "https://tunnel.example.test/webhook-check" for call in probe.call_args_list)

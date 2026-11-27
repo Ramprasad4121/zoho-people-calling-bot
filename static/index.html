@@ -99,9 +99,13 @@ summary { cursor: pointer; color: #000; font-weight: 700; }
   <div class="grid">
     <section class="card">
       <h2>Register Lead &amp; Trigger Call</h2>
-      <p class="hint">Simulates a prospect requesting info on Zoho People. Aria immediately dials them, qualifies their HR bottlenecks, pitches relevant modules, and closes on a free trial or 15-minute demo.</p>
+      <p class="hint">Aria is an AI sales assistant calling from Interloop Consulting. She dials the lead, discloses that she is an AI, qualifies their HR needs, pitches relevant Zoho People modules, and offers a real demo or trial.</p>
 
       <form id="leadForm">
+        <div class="field">
+          <label for="apiToken">Console API token (required for phone calls)</label>
+          <input id="apiToken" type="password" autocomplete="off" placeholder="Value of CALL_API_TOKEN on the server">
+        </div>
         <div class="two">
           <div class="field">
             <label for="leadName">Lead Name</label>
@@ -182,6 +186,14 @@ summary { cursor: pointer; color: #000; font-weight: 700; }
   const BAD = new Set(["error", "failed", "busy", "no-answer", "canceled"]);
   let pollTimer = null;
 
+  const tokenInput = $("apiToken");
+  tokenInput.value = sessionStorage.getItem("aria_console_token") || "";
+  tokenInput.addEventListener("input", () => sessionStorage.setItem("aria_console_token", tokenInput.value.trim()));
+  function authHeaders() {
+    const token = tokenInput.value.trim();
+    return token ? { "X-API-Token": token } : {};
+  }
+
   function showFeedback(text, kind = "") {
     const el = $("feedback");
     el.hidden = false;
@@ -198,7 +210,9 @@ summary { cursor: pointer; color: #000; font-weight: 700; }
       const pills = [
         [h.llm_configured ? `LLM: ${h.llm_model}` : "LLM: offline KB fallback", h.llm_configured ? "ok" : "warn"],
         [h.twilio_configured ? "Twilio: configured" : "Twilio: missing creds", h.twilio_configured ? "ok" : "warn"],
-        [h.public_base_url_configured ? `Tunnel: ${h.public_base_url}` : "Tunnel: PUBLIC_BASE_URL not HTTPS", h.public_base_url_configured ? "ok" : "warn"],
+        [h.public_base_url_configured ? "Tunnel: HTTPS URL configured" : "Tunnel: PUBLIC_BASE_URL not HTTPS", h.public_base_url_configured ? "ok" : "warn"],
+        [h.console_auth_required ? "Console token: required" : "Console token: NOT SET", h.console_auth_required ? "ok" : "warn"],
+        [h.calendly_configured ? "Calendly: configured" : "Calendly: not configured", h.calendly_configured ? "ok" : "warn"],
         [`Active calls: ${h.active_calls}`, "ok"],
       ];
       pills.forEach(([label, cls]) => {
@@ -281,7 +295,7 @@ summary { cursor: pointer; color: #000; font-weight: 700; }
 
   async function refreshCalls() {
     try {
-      const res = await fetch("/web/calls/status");
+      const res = await fetch("/web/calls/status", { headers: authHeaders() });
       if (!res.ok) return;
       const data = await res.json();
       const calls = data.calls || [];
@@ -300,12 +314,16 @@ summary { cursor: pointer; color: #000; font-weight: 700; }
       showFeedback("Enter a phone number in E.164 format (e.g. +9198XXXXXXXX) to place a Twilio call, or click 'Test Live in Browser Mic'.", "err");
       return;
     }
+    if (!tokenInput.value.trim()) {
+      showFeedback("Enter the console API token (CALL_API_TOKEN) before placing a paid call.", "err");
+      return;
+    }
     $("phoneBtn").disabled = true;
-    showFeedback("Dialing via Twilio…");
+    showFeedback("Checking webhook and dialing via Twilio…");
     try {
       const res = await fetch("/leads", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
           lead_name: $("leadName").value.trim(),
           company_name: $("companyName").value.trim(),

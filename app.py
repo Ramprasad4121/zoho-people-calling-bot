@@ -1,260 +1,631 @@
-import json
+"""FastAPI service for the Zoho People AI outbound calling agent.
+
+The phone flow is a small state machine backed by in-memory sessions and an
+append-only JSON transcript snapshot. Twilio's ~15s webhook budget is treated
+as a hard constraint: no blocking network call is allowed to exceed it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
 import logging
 import os
 import re
-import urllib.request
+import secrets
+import time
 import uuid
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import quote, urlparse
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 from twilio.base.exceptions import TwilioRestException
 from twilio.rest import Client as TwilioClient
-from twilio.twiml.voice_response import Gather, VoiceResponse
 
+import integrations
+import security
+import state
+import twiml
 from local_demo import fallback_reply, generate_llm_reply, sanitize_for_tts
 from prompts import build_greeting, build_system_prompt
+from qualification import EMAIL_RE as _EMAIL_RE
+from qualification import extract_qualification
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("zoho_calling_bot")
 
 app = FastAPI(title="Zoho People AI Calling Bot")
 
-DATA_DIR = Path(__file__).parent / "data"
-CALL_HISTORY_PATH = DATA_DIR / "call_history.json"
+# State is re-exported so route code and tests share one mutable store.
+DATA_DIR = state.DATA_DIR
+CALL_HISTORY_PATH = state.CALL_HISTORY_PATH
 STATIC_DIR = Path(__file__).parent / "static"
+CALL_SESSIONS = state.CALL_SESSIONS
+CALL_RECORDS = state.CALL_RECORDS
+WEB_SESSIONS = state.WEB_SESSIONS
+LAST_CALL_REQUEST = state.LAST_CALL_REQUEST
+STATE_LOCK = state.STATE_LOCK
+SESSION_TTL_SECONDS = state.SESSION_TTL_SECONDS
+MAX_TRANSCRIPT_MESSAGES = state.MAX_TRANSCRIPT_MESSAGES
+MAX_RECORDS = state.MAX_RECORDS
+_utc_now_iso = state.utc_now_iso
+_persist_records = state.persist_records
+export_lead_to_webhook = state.export_lead_to_webhook
+record_message = state.record_message
+purge_expired_sessions = state.purge_expired_sessions
+finalize_call = state.finalize_call
 
-# In-memory call session store (backed by JSON history snapshot for inspection)
-CALL_SESSIONS: Dict[str, dict] = {}
-CALL_RECORDS: Dict[str, dict] = {}
-WEB_SESSIONS: Dict[str, dict] = {}
+PREFLIGHT_CACHE: Dict[str, tuple[float, Optional[str]]] = {}
+LLM_CLIENT_CACHE: Dict[tuple, OpenAI] = {}
 
 FINAL_CALL_STATUSES = {"completed", "failed", "busy", "no-answer", "canceled"}
+ACTIVE_CALL_STATUSES = {"queued", "initiated", "ringing", "in-progress"}
+MAX_TURNS = 30
+MAX_SPEECH_CHARS = 500
+MAX_HISTORY_MESSAGES = 24
+DUPLICATE_CALL_WINDOW_SECONDS = 90
+PREFLIGHT_TTL_SECONDS = 60
+
+_DEMO_INTENT_RE = re.compile(
+    r"\b(?:book|schedule|set up|arrange)\b.{0,40}\b(?:demo|meeting|call)\b"
+    r"|\b(?:demo|meeting)\b.{0,40}\b(?:book|schedule|please|yes|interested|works)\b"
+    r"|\b(?:yes|sure|interested|would love)\b.{0,30}\bdemo\b",
+    re.IGNORECASE,
+)
+_HANDOFF_INTENT_RE = re.compile(
+    r"\b(?:human|person|agent|manager|colleague|someone from interloop|team member|transfer)\b"
+    r"|\bspeak to (?:a|your) (?:person|human|manager)\b",
+    re.IGNORECASE,
+)
+_AFFIRMATIVE_RE = re.compile(
+    r"^(?:yes|yeah|yep|yup|sure|please|okay|ok|go ahead|do it|book it|confirm|that works|"
+    r"sounds good|connect me|now)\b|\b(?:yes please|please book|book it|go ahead)\b",
+    re.IGNORECASE,
+)
+_NEGATIVE_RE = re.compile(r"^(?:no|nope|not now|maybe later|cancel|never mind)\b", re.IGNORECASE)
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _redact(exc: object) -> str:
+    return security.redact(exc)
 
 
-def _load_saved_records() -> None:
-    if not CALL_HISTORY_PATH.exists():
-        return
-    try:
-        data = json.loads(CALL_HISTORY_PATH.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            for rec in data:
-                sid = rec.get("call_sid")
-                if sid:
-                    CALL_RECORDS[sid] = rec
-    except Exception as exc:
-        logger.warning("Could not load saved call history: %s", exc)
+def _safe_error(exc: object) -> str:
+    """Short, useful, credential-free error text for API responses."""
+    text = _redact(exc)
+    return text[:300] if text else exc.__class__.__name__
 
 
-def _persist_records() -> None:
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        records = list(CALL_RECORDS.values())[-100:]
-        CALL_HISTORY_PATH.write_text(json.dumps(records, indent=2), encoding="utf-8")
-    except Exception as exc:
-        logger.warning("Could not persist call history: %s", exc)
+# --- Configuration, LLM and webhook reachability --------------------------
 
 
-_load_saved_records()
+def public_base_url() -> str:
+    """Absolute URLs are required for TwiML actions, especially on trial accounts."""
+    return (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+
+
+def llm_timeout_seconds() -> float:
+    from local_demo import llm_timeout_seconds as _timeout
+
+    return _timeout()
 
 
 def get_llm_client() -> tuple[OpenAI, str]:
-    """Supports OpenAI or any OpenAI-compatible provider (e.g. Groq, Ollama)."""
-    api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY")
+    """Supports OpenAI or any OpenAI-compatible provider (Groq, OpenRouter, Ollama)."""
+    api_key = (
+        os.getenv("LLM_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or os.getenv("GROQ_API_KEY")
+    )
     if not api_key:
         raise RuntimeError("Missing LLM_API_KEY / OPENAI_API_KEY / GROQ_API_KEY in environment.")
     base_url = os.getenv("LLM_BASE_URL") or None
     model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-    if base_url:
-        logger.info("Using LLM base_url=%s model=%s", base_url, model)
-    client = (
-        OpenAI(api_key=api_key, base_url=base_url, timeout=20.0, max_retries=0)
-        if base_url
-        else OpenAI(api_key=api_key, timeout=20.0, max_retries=0)
-    )
+    timeout = llm_timeout_seconds()
+    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+    cache_key = (key_hash, base_url, model, timeout)
+    with STATE_LOCK:
+        cached = LLM_CLIENT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached, model
+        kwargs = {"api_key": api_key, "timeout": timeout, "max_retries": 0}
+        if base_url:
+            kwargs["base_url"] = base_url
+        client = OpenAI(**kwargs)
+        LLM_CLIENT_CACHE[cache_key] = client
+    if len(LLM_CLIENT_CACHE) > 8:
+        with STATE_LOCK:
+            LLM_CLIENT_CACHE.clear()
+            LLM_CLIENT_CACHE[cache_key] = client
+    logger.info("event=llm_ready model=%s provider=%s", model, "custom" if base_url else "openai")
     return client, model
 
 
-def extract_qualification(transcript: list[dict], lead_meta: dict | None = None) -> dict:
-    """Derive a structured sales qualification summary from the conversation transcript."""
-    lead_meta = lead_meta or {}
-    user_lines = [m["text"] for m in transcript if m.get("role") == "user"]
-    user_text = " ".join(user_lines)
-    full_user_text = user_text.lower()
-    all_text = " ".join(m.get("text", "") for m in transcript).lower()
-
-    detected_size = lead_meta.get("team_size") or ""
-    if not detected_size:
-        size_match = re.search(
-            r"\b(\d{1,5})\s*(?:employees?|people|staff|users?|members?|folks)\b",
-            full_user_text,
-        )
-        if size_match:
-            detected_size = size_match.group(1)
-
-    topic_map = {
-        "Attendance & Shifts": ["attendance", "shift", "roster", "biometric", "geo", "timesheet"],
-        "Leave Management": ["leave", "time-off", "time off", "holiday"],
-        "Onboarding & Recruitment": ["onboard", "recruit", "hire", "document", "offboard"],
-        "Performance & OKRs": ["performance", "okr", "appraisal", "kpi", "kra", "review"],
-        "Payroll & Expense": ["payroll", "salary", "expense", "reimburse", "payslip"],
-        "LMS & Training": ["lms", "learning", "training", "course"],
-        "HR Help Desk": ["help desk", "helpdesk", "ticket", "grievance", "sla"],
-        "Pricing & Trial": ["price", "pricing", "cost", "plan", "trial", "quote"],
-    }
-    interests = [
-        label for label, keywords in topic_map.items() if any(kw in full_user_text for kw in keywords)
-    ]
-    if lead_meta.get("primary_interest") and lead_meta["primary_interest"] not in interests:
-        interests.insert(0, lead_meta["primary_interest"])
-
-    email_match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", full_user_text)
-    email = email_match.group(0) if email_match else lead_meta.get("email", "")
-
-    next_step = "Needs follow-up"
-    if any(w in all_text for w in ["demo", "schedule", "15-minute", "calendar"]):
-        next_step = "Live demo discussed"
-    if any(w in all_text for w in ["free trial", "trial link"]):
-        next_step = "Free trial / Demo follow-up"
-    if any(w in full_user_text for w in ["not interested", "no thanks", "don't need"]):
-        next_step = "Not interested"
-
-    budget_match = re.search(
-        r"\b(?:budget|spend|spending|afford|price range)\b[^.!?]{0,40}"
-        r"(?:(?:rs\.?|inr|₹|rupees?)\s*)?\d[\d,]*(?:\.\d+)?\s*"
-        r"(?:lakh|lac|lakhs|lacs|crore|crores|cr|thousand|k)?",
-        user_text,
-        re.IGNORECASE,
-    )
-    if not budget_match:
-        budget_match = re.search(
-            r"(?:(?:rs\.?|inr|₹|rupees?)\s*\d[\d,]*(?:\.\d+)?"
-            r"|\d[\d,]*(?:\.\d+)?\s*(?:lakh|lac|lakhs|lacs|crore|crores|cr))\b",
-            user_text,
-            re.IGNORECASE,
-        )
-    budget = budget_match.group(0).strip() if budget_match else ""
-
-    authority = ""
-    if re.search(
-        r"\b(?:i(?:'m| am)|we(?:'re| are))\s+(?:the\s+)?(?:final\s+)?decision[- ]?mak(?:er|ers)\b"
-        r"|\b(?:i|we)\s+(?:make|own|approve|sign off on)\s+(?:the\s+)?(?:final\s+)?(?:decision|call|budget|purchase)\b"
-        r"|\b(?:i|we)\s+(?:can|get to)\s+(?:decide|approve)\b"
-        r"|\b(?:i|we)\s+decide\b"
-        r"|\bdecision is (?:mine|ours)\b",
-        full_user_text,
-    ):
-        authority = "Decision maker"
-    elif re.search(
-        r"\b(?:need|needs|need to|have to|get|getting|requires?|wait for)\s+(?:to\s+)?"
-        r"(?:approval|approve|sign[- ]?off|buy[- ]?in|manager|boss|founder|ceo|cfo|finance|hr head|leadership|committee)\b"
-        r"|\b(?:check|clear|run it by)\s+(?:with\s+)?(?:my|our)\s+[a-z]+\b"
-        r"|\b(?:my|our)\s+(?:manager|boss|ceo|founder|finance team|hr head|leadership)\s+"
-        r"(?:approves?|decides?|signs? off)\b",
-        full_user_text,
-    ):
-        authority = "Needs approval"
-
-    timeline = ""
-    for pattern, label in (
-        (r"\basap\b|\bas soon as possible\b|\bimmediately\b|\burgently\b|\bright away\b|\bthis week\b", "ASAP"),
-        (r"\bthis month\b|\bby (?:the )?end of (?:this )?month\b", "this month"),
-        (r"\bnext month\b", "next month"),
-        (r"\bthis quarter\b|\bby (?:the )?end of (?:this )?quarter\b", "this quarter"),
-        (r"\bnext quarter\b", "next quarter"),
-        (r"\b(?:in|within|over)\s+(?:the\s+)?next\s+\d+\s+(?:days|weeks|months)\b", ""),
-    ):
-        match = re.search(pattern, full_user_text)
-        if match:
-            timeline = label or match.group(0)
-            break
-
-    time_phrase = (
-        r"(?:\s+(?:at|around|by|for)?\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)"
-        r"|\s+(?:morning|afternoon|evening))?"
-    )
-    appointment = ""
-    for pattern in (
-        r"\b(?:mon(?:day)?|tues(?:day)?|wednes(?:day)?|thurs(?:day)?|fri(?:day)?|satur(?:day)?|sun(?:day)?)\b"
-        + time_phrase,
-        r"\b(?:today|tomorrow|next week)\b" + time_phrase,
-        r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
-        r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+"
-        r"\d{1,2}(?:st|nd|rd|th)?\b" + time_phrase,
-        r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b",
-    ):
-        match = re.search(pattern, user_text, re.IGNORECASE)
-        if match:
-            appointment = match.group(0).strip()
-            break
-
-    return {
-        "team_size": detected_size or "Not captured yet",
-        "topics": interests,
-        "email": email,
-        "next_step": next_step,
-        "turns": len(user_lines),
-        "budget": budget,
-        "authority": authority,
-        "timeline": timeline,
-        "appointment": appointment,
-    }
-
-
-def export_lead_to_webhook(record: dict) -> None:
-    """Post a lead record once, if a webhook URL is configured. Never raises."""
-    if record.get("exported"):
+def verify_webhook_url(url: str) -> None:
+    """Fail before placing a paid call when Twilio could not fetch our webhook."""
+    if os.getenv("SKIP_WEBHOOK_PREFLIGHT", "false").strip().lower() in {"1", "true", "yes"}:
         return
-    url = os.getenv("SALES_WEBHOOK_URL", "").strip()
-    if not url:
-        return
+    now = time.monotonic()
+    with STATE_LOCK:
+        cached = PREFLIGHT_CACHE.get(url)
+        if cached and now - cached[0] < PREFLIGHT_TTL_SECONDS and cached[1] is None:
+            return
 
-    record["exported"] = True
+    config_error = security.webhook_url_error(url)
+    if config_error:
+        with STATE_LOCK:
+            PREFLIGHT_CACHE[url] = (now, config_error)
+        raise HTTPException(status_code=503, detail=config_error)
+
     try:
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(record).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=2) as response:
-            response.read()
+        raw = security.fetch_url(f"{url}/webhook-check", timeout=5, max_bytes=1000)
+        if raw.decode("utf-8", errors="replace").strip() != "ok":
+            raise ValueError("webhook probe did not report ok")
     except Exception as exc:
-        logger.warning("Lead webhook export failed: %s", exc)
+        message = (
+            f"PUBLIC_BASE_URL ({urlparse(url).hostname}) is not reachable from this server: {_safe_error(exc)}. "
+            "Restart the tunnel, then set PUBLIC_BASE_URL to the new public HTTPS URL."
+        )
+        with STATE_LOCK:
+            PREFLIGHT_CACHE[url] = (now, message)
+        logger.error("event=webhook_preflight_failed host=%s error=%s", urlparse(url).hostname, _redact(exc))
+        raise HTTPException(status_code=503, detail=message) from exc
+
+    with STATE_LOCK:
+        PREFLIGHT_CACHE[url] = (now, None)
+
+
+def voice_name() -> str:
+    voice = (os.getenv("TWILIO_VOICE", "Polly.Aditi") or "Polly.Aditi").strip()
+    return voice if re.fullmatch(r"[A-Za-z0-9._-]+", voice) else "Polly.Aditi"
+
+
+def handoff_number() -> str:
+    raw = (os.getenv("HANDOFF_PHONE_NUMBER") or "").strip()
+    if not raw:
+        return ""
+    try:
+        return security.normalize_phone_number(raw)
+    except ValueError:
+        logger.error("event=handoff_number_invalid")
+        return ""
+
+
+# --- Requests and call placement ------------------------------------------
 
 
 class OutboundCallRequest(BaseModel):
-    to_number: str
-    lead_name: str = "Alex"
-    company_name: str = "Acme"
-    team_size: str = ""
-    primary_interest: str = ""
-    email: str = ""
+    to_number: str = Field(..., max_length=32)
+    lead_name: str = Field(default="Alex", max_length=100)
+    company_name: str = Field(default="Acme", max_length=100)
+    team_size: str = Field(default="", max_length=60)
+    primary_interest: str = Field(default="", max_length=120)
+    email: str = Field(default="", max_length=200)
 
 
 class BatchCallRequest(BaseModel):
-    contacts: List[OutboundCallRequest]
+    contacts: List[OutboundCallRequest] = Field(..., max_length=20)
 
 
 class LeadRegistrationRequest(BaseModel):
-    lead_name: str
-    company_name: str = "Acme"
-    to_number: str = ""
-    team_size: str = ""
-    primary_interest: str = ""
-    email: str = ""
-    channel: str = "phone"  # "phone" or "browser"
+    lead_name: str = Field(..., max_length=100)
+    company_name: str = Field(default="Acme", max_length=100)
+    to_number: str = Field(default="", max_length=32)
+    team_size: str = Field(default="", max_length=60)
+    primary_interest: str = Field(default="", max_length=120)
+    email: str = Field(default="", max_length=200)
+    channel: str = Field(default="phone", pattern="^(phone|browser)$")
+
+
+class WebStartRequest(BaseModel):
+    lead_name: str = Field(default="Alex", max_length=100)
+    company_name: str = Field(default="Acme", max_length=100)
+    team_size: str = Field(default="", max_length=60)
+    primary_interest: str = Field(default="", max_length=120)
+    email: str = Field(default="", max_length=200)
+
+
+class WebTurnRequest(BaseModel):
+    session_id: str = Field(..., max_length=80)
+    message: str = Field(..., max_length=1000)
+
+
+class WebEndRequest(BaseModel):
+    session_id: str = Field(..., max_length=80)
+
+
+@dataclass
+class IntentOutcome:
+    reply: Optional[str] = None
+    dial_to: str = ""
+    end_call: bool = False
+
+
+def _live_context() -> Optional[dict]:
+    try:
+        return integrations.get_research(allow_fetch=True)
+    except Exception as exc:
+        logger.warning("event=research_unavailable error=%s", _redact(exc))
+        return None
+
+
+def _new_session(lead_name: str, company_name: str, lead_meta: dict, to_number: str = "") -> dict:
+    live = _live_context()
+    return {
+        "lead_name": lead_name,
+        "company_name": company_name,
+        "lead_meta": lead_meta,
+        "to_number": to_number,
+        "webhook_token": secrets.token_urlsafe(24),
+        "silence_count": 0,
+        "turn_count": 0,
+        "touch": time.monotonic(),
+        "created_at": _utc_now_iso(),
+        "history": [
+            {
+                "role": "system",
+                "content": build_system_prompt(
+                    lead_name,
+                    company_name,
+                    team_size=lead_meta.get("team_size", ""),
+                    primary_interest=lead_meta.get("primary_interest", ""),
+                    live_context=live,
+                ),
+            }
+        ],
+    }
+
+
+def place_outbound_call(payload: OutboundCallRequest) -> dict:
+    purge_expired_sessions()
+    account_sid = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip()
+    auth_token = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip()
+    from_number = (os.getenv("TWILIO_PHONE_NUMBER") or "").strip()
+    base_url = public_base_url()
+
+    missing = []
+    if not account_sid.startswith("AC"):
+        missing.append("TWILIO_ACCOUNT_SID")
+    if not auth_token:
+        missing.append("TWILIO_AUTH_TOKEN")
+    try:
+        from_number = security.normalize_phone_number(from_number)
+    except ValueError:
+        missing.append("TWILIO_PHONE_NUMBER (must be E.164)")
+    if not base_url:
+        missing.append("PUBLIC_BASE_URL")
+    if missing:
+        raise HTTPException(status_code=503, detail="Missing or invalid configuration: " + ", ".join(missing) + ".")
+
+    try:
+        to_number = security.normalize_phone_number(payload.to_number)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    verify_webhook_url(base_url)
+
+    now = time.monotonic()
+    with STATE_LOCK:
+        recent = LAST_CALL_REQUEST.get(to_number, 0)
+        if now - recent < DUPLICATE_CALL_WINDOW_SECONDS:
+            raise HTTPException(status_code=409, detail="A call to this number was just initiated. Please wait before retrying.")
+        if any(
+            session.get("to_number") == to_number and session.get("status") in ACTIVE_CALL_STATUSES
+            for session in CALL_SESSIONS.values()
+        ):
+            raise HTTPException(status_code=409, detail="A call to this number is already in progress.")
+        LAST_CALL_REQUEST[to_number] = now
+
+    lead_meta = {
+        "team_size": payload.team_size.strip(),
+        "primary_interest": payload.primary_interest.strip(),
+        "email": payload.email.strip(),
+    }
+    lead_name = payload.lead_name.strip() or "there"
+    company_name = payload.company_name.strip() or "your company"
+    temp_sid = f"pending:{uuid.uuid4()}"
+    session = _new_session(lead_name, company_name, lead_meta, to_number=to_number)
+    session["status"] = "queued"
+    record = {
+        "call_sid": temp_sid,
+        "channel": "phone",
+        "created_at": _utc_now_iso(),
+        "to_number": to_number,
+        "lead_name": lead_name,
+        "company_name": company_name,
+        "lead_meta": lead_meta,
+        "status": "queued",
+        "duration": "",
+        "transcript": [],
+        "qualification": extract_qualification([], lead_meta),
+        "exported": False,
+    }
+    with STATE_LOCK:
+        CALL_SESSIONS[temp_sid] = session
+        CALL_RECORDS[temp_sid] = record
+        _persist_records()
+
+    try:
+        twilio_client = TwilioClient(account_sid, auth_token)
+        call = twilio_client.calls.create(
+            to=to_number,
+            from_=from_number,
+            url=f"{base_url}/twilio/voice?token={quote(session['webhook_token'])}",
+            method="POST",
+            status_callback=f"{base_url}/twilio/status",
+            status_callback_event=["initiated", "ringing", "in-progress", "completed"],
+        )
+    except TwilioRestException as exc:
+        _cleanup_pending(temp_sid, to_number)
+        detail = _twilio_error_detail(exc)
+        logger.error("event=twilio_call_failed code=%s status=%s error=%s", exc.code, exc.status, _redact(exc.msg))
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:
+        _cleanup_pending(temp_sid, to_number)
+        logger.error("event=twilio_call_failed error=%s", _redact(exc))
+        raise HTTPException(status_code=502, detail=f"Twilio call request failed: {_safe_error(exc)}") from exc
+
+    sid = str(call.sid)
+    with STATE_LOCK:
+        adopted = CALL_SESSIONS.pop(temp_sid, None) or CALL_SESSIONS.pop(sid, None)
+        if adopted is not None:
+            adopted["status"] = call.status or "queued"
+            adopted["touch"] = time.monotonic()
+            CALL_SESSIONS[sid] = adopted
+        adopted_record = CALL_RECORDS.pop(temp_sid, None) or CALL_RECORDS.pop(sid, None)
+        if adopted_record is not None:
+            adopted_record["call_sid"] = sid
+            adopted_record["status"] = call.status or "queued"
+            CALL_RECORDS[sid] = adopted_record
+            record = adopted_record
+        _persist_records()
+
+    logger.info(
+        "event=call_created channel=phone sid=%s to=%s status=%s",
+        sid,
+        security.mask_phone(to_number),
+        call.status or "queued",
+    )
+    return {"status": call.status or "queued", "call_sid": sid, "to": to_number}
+
+
+def _cleanup_pending(temp_sid: str, to_number: str) -> None:
+    with STATE_LOCK:
+        CALL_SESSIONS.pop(temp_sid, None)
+        CALL_RECORDS.pop(temp_sid, None)
+        LAST_CALL_REQUEST.pop(to_number, None)
+        _persist_records()
+
+
+def _twilio_error_detail(exc: TwilioRestException) -> str:
+    message = str(getattr(exc, "msg", "")) or "Twilio rejected the call."
+    code = getattr(exc, "code", "")
+    if code in {21219, 30007, 30023} or "not verified" in message.lower() or "trial" in message.lower():
+        return (
+            f"Twilio trial restriction ({code}): the recipient must be a verified number in the sign-up country. "
+            "Verify this number in Twilio Console → Voice → Try out Voice, then retry."
+        )
+    if code in {20404, 20003} or "authenticate" in message.lower():
+        return "Twilio rejected the credentials. Check TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN."
+    return f"Twilio error ({code}): {_redact(message)[:220]}"
+
+
+def _adopt_pending_session(call_sid: str, from_number: str) -> Optional[dict]:
+    """Recover lead context if Twilio fetches the webhook before call creation returns."""
+    with STATE_LOCK:
+        for sid, session in list(CALL_SESSIONS.items()):
+            if sid.startswith("pending:") and session.get("to_number") == from_number:
+                session["touch"] = time.monotonic()
+                CALL_SESSIONS[call_sid] = session
+                CALL_SESSIONS.pop(sid, None)
+                record = CALL_RECORDS.pop(sid, None)
+                if record:
+                    record["call_sid"] = call_sid
+                    CALL_RECORDS[call_sid] = record
+                    _persist_records()
+                return session
+    return None
+
+
+# --- TwiML helpers ---------------------------------------------------------
+
+
+def gather_twiml(text: str, *, retry: bool = False, token: str = "") -> Response:
+    return twiml.gather(
+        text,
+        base_url=public_base_url(),
+        voice=voice_name(),
+        retry=retry,
+        token=token,
+    )
+
+
+def hangup_twiml(text: str) -> Response:
+    return twiml.hangup(text, voice=voice_name())
+
+
+def dial_twiml(target: str, *, token: str = "") -> Response:
+    try:
+        caller_id = security.normalize_phone_number(os.getenv("TWILIO_PHONE_NUMBER", ""))
+    except ValueError:
+        caller_id = ""
+    return twiml.dial(
+        target,
+        base_url=public_base_url(),
+        voice=voice_name(),
+        caller_id=caller_id,
+        token=token,
+    )
+
+
+def session_for_webhook_token(token: str) -> Optional[dict]:
+    if not token:
+        return None
+    for session in CALL_SESSIONS.values():
+        if session.get("webhook_token") == token:
+            return session
+    return None
+
+
+async def twilio_form(request: Request, *, expected_token: str = "") -> Dict[str, str]:
+    form = await request.form()
+    signed_params = {key: str(value) for key, value in form.items() if isinstance(value, str)}
+    security.verify_twilio_signature(request, signed_params, fallback_token=expected_token)
+    params = dict(request.query_params)
+    params.update(signed_params)
+    return params
+
+
+# --- Calendly / handoff intent layer --------------------------------------
+
+
+def _extract_email(text: str) -> str:
+    match = _EMAIL_RE.search(text)
+    return match.group(0) if match else ""
+
+
+def _match_slot(spoken: str, slots: list[dict]) -> Optional[dict]:
+    value = spoken.lower()
+    ordinal = {"first": 0, "1st": 0, "one": 0, "earliest": 0, "second": 1, "2nd": 1, "two": 1, "third": 2, "3rd": 2, "three": 2}
+    for word, index in ordinal.items():
+        if re.search(rf"\b{word}\b", value) and index < len(slots):
+            return slots[index]
+    for slot in slots:
+        label = slot.get("label", "").lower()
+        tokens = [t for t in re.findall(r"[a-z]+|\d{1,2}:\d{2}", label) if len(t) > 3]
+        if any(t in value for t in tokens):
+            return slot
+    return None
+
+
+def handle_intents(session: dict, spoken: str, record: Optional[dict]) -> IntentOutcome:
+    """Deterministic guards for real-world actions. Never books or transfers on guesswork."""
+    lead_meta = session.setdefault("lead_meta", {})
+
+    dial = handoff_number()
+    if session.get("handoff_pending") and _AFFIRMATIVE_RE.search(spoken):
+        session["handoff_pending"] = False
+        session["handoff_dialed"] = True
+        if record is not None:
+            record["next_step"] = "Transferred to human"
+            record["qualification"] = extract_qualification(record.get("transcript", []), lead_meta)
+        return IntentOutcome(dial_to=dial) if dial else IntentOutcome(
+            reply="I am sorry, live transfers are not configured right now. I can still arrange a callback for you."
+        )
+    if session.get("handoff_pending") and _NEGATIVE_RE.search(spoken):
+        session["handoff_pending"] = False
+        return IntentOutcome(reply="No problem, I am happy to continue here.")
+
+    if _HANDOFF_INTENT_RE.search(spoken):
+        if not dial:
+            return IntentOutcome(reply="I can arrange for someone from Interloop Consulting to call you back.")
+        session["handoff_pending"] = True
+        return IntentOutcome(reply="Of course. Just to confirm, would you like me to connect you with a colleague now?")
+
+    if not integrations.calendly_configured():
+        return IntentOutcome()
+
+    email = lead_meta.get("email") or (record or {}).get("qualification", {}).get("email", "")
+    if session.get("awaiting_email"):
+        found = _extract_email(spoken)
+        if found:
+            lead_meta["email"] = found
+            session["awaiting_email"] = False
+        else:
+            return IntentOutcome(reply="Could you say the email address once more? For example, name at company dot com.")
+
+    pending_booking = session.get("pending_booking")
+    if pending_booking:
+        if _AFFIRMATIVE_RE.search(spoken):
+            try:
+                booking = integrations.book_slot(
+                    start_time=pending_booking["start_time"],
+                    lead_name=session.get("lead_name", "Prospect"),
+                    email=lead_meta.get("email", ""),
+                    timezone_name=os.getenv("CALENDLY_INVITEE_TIMEZONE", "Asia/Kolkata"),
+                )
+            except Exception as exc:
+                logger.warning("event=calendly_booking_failed error=%s", _redact(exc))
+                session["pending_booking"] = None
+                return IntentOutcome(reply="I could not complete the booking just now. Let me find another time for you.")
+            lead_meta["booking"] = booking
+            session["pending_booking"] = None
+            session["booked"] = True
+            if record is not None:
+                record["calendly_booking"] = booking
+                record["qualification"] = extract_qualification(record.get("transcript", []), lead_meta)
+            return IntentOutcome(
+                reply=f"Done. Your 15-minute demo is booked for {pending_booking['label']}. You will get a calendar invitation shortly."
+            )
+        if _NEGATIVE_RE.search(spoken):
+            session["pending_booking"] = None
+            return IntentOutcome(reply="No problem, I have not booked anything.")
+        return IntentOutcome(reply="Please say yes to confirm the booking, or no to cancel.")
+
+    pending_slots = session.get("pending_slots")
+    if pending_slots:
+        chosen = _match_slot(spoken, pending_slots)
+        if chosen:
+            session["pending_slots"] = None
+            session["pending_booking"] = chosen
+            return IntentOutcome(
+                reply=f"Great, {chosen['label']}. Just to confirm, should I book that 15-minute demo for you?"
+            )
+        session["pending_slots"] = None
+        return IntentOutcome(reply="I could not match that time. Let me know if you would like me to check again.")
+
+    if _DEMO_INTENT_RE.search(spoken):
+        if not email:
+            session["awaiting_email"] = True
+            return IntentOutcome(reply="Happy to set that up. What email address should I send the invitation to?")
+        try:
+            slots = integrations.available_slots()
+        except Exception as exc:
+            logger.warning("event=calendly_slots_failed error=%s", _redact(exc))
+            return IntentOutcome()
+        session["pending_slots"] = slots
+        ordinal_words = ["one", "two", "three"]
+        offer = (
+            "I have "
+            + ", ".join(
+                f"option {ordinal_words[i] if i < len(ordinal_words) else i + 1}, {slot['label']}"
+                for i, slot in enumerate(slots)
+            )
+            + ". Which works for you?"
+        )
+        return IntentOutcome(reply=offer)
+
+    return IntentOutcome()
+
+
+async def llm_reply(session: dict) -> Optional[str]:
+    try:
+        client, model = get_llm_client()
+        return await asyncio.wait_for(
+            run_in_threadpool(generate_llm_reply, client, model, session["history"]),
+            timeout=llm_timeout_seconds() + 2,
+        )
+    except Exception as exc:
+        logger.warning("event=llm_fallback error=%s", _redact(exc))
+        return None
+
+
+def append_turn(session: dict, role: str, text: str) -> None:
+    session["history"].append({"role": role, "content": text})
+    if len(session["history"]) > MAX_HISTORY_MESSAGES:
+        del session["history"][1 : len(session["history"]) - MAX_HISTORY_MESSAGES + 1]
+
+
+# --- Routes: pages and health ---------------------------------------------
 
 
 @app.get("/")
@@ -265,12 +636,12 @@ def root_console():
 @app.get("/health")
 def health():
     llm_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY")
-    twilio_ok = all(
-        os.getenv(k) for k in ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER")
+    twilio_ok = bool(
+        (os.getenv("TWILIO_ACCOUNT_SID") or "").startswith("AC")
+        and os.getenv("TWILIO_AUTH_TOKEN")
+        and os.getenv("TWILIO_PHONE_NUMBER")
     )
-    public_url = (os.getenv("PUBLIC_BASE_URL") or "").strip()
-    public_ok = public_url.startswith("https://")
-    llm_base = (os.getenv("LLM_BASE_URL") or "").strip()
+    public_ok = bool(public_base_url().startswith("https://"))
     return {
         "status": "ok",
         "active_calls": len(CALL_SESSIONS),
@@ -278,120 +649,37 @@ def health():
         "recorded_calls": len(CALL_RECORDS),
         "llm_configured": bool(llm_key),
         "llm_model": os.getenv("LLM_MODEL", "gpt-4o-mini") if llm_key else "offline-kb-rules",
-        "llm_base_url": llm_base if llm_key else "",
         "twilio_configured": twilio_ok,
         "public_base_url_configured": public_ok,
-        "public_base_url": public_url if public_ok else "",
         "ready_for_phone_calls": twilio_ok and public_ok,
+        "console_auth_required": security.call_token_configured(),
+        "twilio_signature_validation": security.signature_validation_enabled(),
+        "calendly_configured": integrations.calendly_configured(),
+        "handoff_configured": bool(handoff_number()),
+        "research": integrations.research_status(),
     }
 
 
-def normalize_phone_number(number: str) -> str:
-    """Twilio expects E.164, e.g. +15551234567."""
-    cleaned = number.strip().replace(" ", "").replace("-", "")
-    if not cleaned.startswith("+") or not cleaned[1:].isdigit() or not 8 <= len(cleaned) <= 16:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid number {number!r}; use E.164 format like +15551234567.",
-        )
-    return cleaned
-
-
-def place_outbound_call(payload: OutboundCallRequest) -> dict:
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    from_number = os.getenv("TWILIO_PHONE_NUMBER")
-    public_url = os.getenv("PUBLIC_BASE_URL")
-
-    if not all([account_sid, auth_token, from_number, public_url]):
-        raise HTTPException(
-            status_code=500,
-            detail="Missing Twilio or PUBLIC_BASE_URL environment variables.",
-        )
-
-    to_number = normalize_phone_number(payload.to_number)
-    twilio_client = TwilioClient(account_sid, auth_token)
-    base_url = public_url.rstrip("/")
-
-    try:
-        call = twilio_client.calls.create(
-            to=to_number,
-            from_=from_number,
-            url=f"{base_url}/twilio/voice",
-            status_callback=f"{base_url}/twilio/status",
-            status_callback_event=["initiated", "ringing", "in-progress", "completed"],
-        )
-    except TwilioRestException as exc:
-        logger.error("Twilio call creation failed for %s: %s", to_number, exc.msg)
-        raise HTTPException(status_code=400, detail=f"Twilio error ({exc.code}): {exc.msg}") from exc
-
-    lead_meta = {
-        "team_size": payload.team_size.strip(),
-        "primary_interest": payload.primary_interest.strip(),
-        "email": payload.email.strip(),
-    }
-    CALL_SESSIONS[call.sid] = {
-        "lead_name": payload.lead_name,
-        "company_name": payload.company_name,
-        "lead_meta": lead_meta,
-        "silence_count": 0,
-        "history": [
-            {
-                "role": "system",
-                "content": build_system_prompt(
-                    payload.lead_name,
-                    payload.company_name,
-                    team_size=lead_meta["team_size"],
-                    primary_interest=lead_meta["primary_interest"],
-                ),
-            }
-        ],
-    }
-    CALL_RECORDS[call.sid] = {
-        "call_sid": call.sid,
-        "channel": "phone",
-        "created_at": _utc_now_iso(),
-        "to_number": to_number,
-        "lead_name": payload.lead_name,
-        "company_name": payload.company_name,
-        "lead_meta": lead_meta,
-        "status": call.status or "queued",
-        "duration": "",
-        "transcript": [],
-        "qualification": extract_qualification([], lead_meta),
-        "exported": False,
-    }
-    _persist_records()
-
-    return {"status": call.status or "queued", "call_sid": call.sid, "to": to_number}
-
-
-def record_message(call_sid: str, role: str, text: str) -> None:
-    record = CALL_RECORDS.get(call_sid)
-    if record is not None:
-        record["transcript"].append({"role": role, "text": text})
-        record["qualification"] = extract_qualification(record["transcript"], record.get("lead_meta"))
-        _persist_records()
-
-
-def public_base_url() -> str:
-    """Absolute URLs are required for TwiML action URLs on trial accounts."""
-    return os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+@app.get("/webhook-check")
+def webhook_check():
+    """Cheap public probe used by the preflight check; exposes no configuration."""
+    return PlainTextResponse("ok")
 
 
 @app.post("/call")
-def trigger_outbound_call(payload: OutboundCallRequest):
-    return place_outbound_call(payload)
+async def trigger_outbound_call(request: Request, payload: OutboundCallRequest):
+    security.require_call_token(request)
+    security.rate_limit(request, "call", limit=10)
+    return await run_in_threadpool(place_outbound_call, payload)
 
 
 @app.post("/leads")
-def register_lead(payload: LeadRegistrationRequest):
-    """Lead registration endpoint: saves lead context and either dials via Twilio or starts a browser session."""
+async def register_lead(request: Request, payload: LeadRegistrationRequest):
+    security.rate_limit(request, "leads", limit=10)
     lead_name = payload.lead_name.strip() or "there"
     company_name = payload.company_name.strip() or "your company"
-
     if payload.channel == "browser":
-        return web_start(
+        return _web_start(
             WebStartRequest(
                 lead_name=lead_name,
                 company_name=company_name,
@@ -400,11 +688,11 @@ def register_lead(payload: LeadRegistrationRequest):
                 email=payload.email,
             )
         )
-
+    security.require_call_token(request)
     if not payload.to_number.strip():
         raise HTTPException(status_code=400, detail="Phone number is required for phone calls.")
-
-    return place_outbound_call(
+    return await run_in_threadpool(
+        place_outbound_call,
         OutboundCallRequest(
             to_number=payload.to_number,
             lead_name=lead_name,
@@ -412,11 +700,9 @@ def register_lead(payload: LeadRegistrationRequest):
             team_size=payload.team_size,
             primary_interest=payload.primary_interest,
             email=payload.email,
-        )
+        ),
     )
 
-
-# --- Web dashboard for launching several phone calls ---
 
 @app.get("/web/calls")
 def browser_call_dashboard():
@@ -424,48 +710,72 @@ def browser_call_dashboard():
 
 
 @app.post("/web/calls")
-def web_launch_calls(payload: BatchCallRequest):
-    if not payload.contacts:
-        raise HTTPException(status_code=400, detail="Add at least one phone number.")
-    if len(payload.contacts) > 20:
-        raise HTTPException(status_code=400, detail="Maximum 20 numbers per batch.")
-
+async def web_launch_calls(request: Request, payload: BatchCallRequest):
+    security.require_call_token(request)
+    security.rate_limit(request, "batch", limit=3)
     results = []
     for contact in payload.contacts:
         try:
-            results.append(place_outbound_call(contact))
+            results.append(await run_in_threadpool(place_outbound_call, contact))
         except HTTPException as exc:
             results.append({"status": "error", "to": contact.to_number, "error": exc.detail})
         except Exception as exc:
-            results.append({"status": "error", "to": contact.to_number, "error": str(exc)})
+            results.append({"status": "error", "to": contact.to_number, "error": _safe_error(exc)})
     return {"calls": results}
 
 
 @app.get("/web/calls/status")
-def web_call_status():
+def web_call_status(request: Request):
+    security.require_call_token(request)
+    security.rate_limit(request, "status", limit=60)
     calls = list(reversed(list(CALL_RECORDS.values())))
     return {"calls": calls}
 
 
-@app.post("/twilio/voice")
-async def twilio_voice_entry(
-    CallSid: str = Form(...),
-    SpeechResult: str = Form(default=""),
-):
-    logger.info("Twilio webhook: sid=%s speech=%r", CallSid, SpeechResult[:80])
-    if SpeechResult.strip():
-        return await twilio_respond(CallSid=CallSid, SpeechResult=SpeechResult)
+# --- Routes: Twilio --------------------------------------------------------
 
-    session = CALL_SESSIONS.setdefault(
-        CallSid,
-        {
-            "lead_name": "there",
-            "company_name": "your team",
-            "lead_meta": {},
-            "silence_count": 0,
-            "history": [{"role": "system", "content": build_system_prompt()}],
-        },
-    )
+
+@app.api_route("/twilio/voice", methods=["GET", "POST"])
+async def twilio_voice_entry(request: Request):
+    query_token = request.query_params.get("token", "")
+    expected_token = query_token if session_for_webhook_token(query_token) else ""
+    params = await twilio_form(request, expected_token=expected_token)
+    call_sid = params.get("CallSid", "").strip()
+    if not call_sid:
+        return hangup_twiml("I cannot identify this call. Goodbye!")
+    speech = params.get("SpeechResult", "").strip()
+    logger.info("event=twilio_voice sid=%s speech_length=%d", call_sid, len(speech))
+    if speech:
+        return await twilio_respond_request(request, params, call_sid, speech)
+
+    session = CALL_SESSIONS.get(call_sid)
+    if not session:
+        session = _adopt_pending_session(call_sid, params.get("From", "").strip())
+    if not session:
+        session = _new_session("there", "your team", {})
+        session["to_number"] = params.get("To", "")
+    session["status"] = "in-progress"
+    session["touch"] = time.monotonic()
+    CALL_SESSIONS[call_sid] = session
+
+    with STATE_LOCK:
+        record = CALL_RECORDS.get(call_sid)
+        if record is None:
+            adopted = CALL_RECORDS.pop(f"adopted:{call_sid}", None)
+            record = adopted or {
+                "call_sid": call_sid,
+                "channel": "phone",
+                "created_at": _utc_now_iso(),
+                "to_number": params.get("From", ""),
+                "lead_name": session["lead_name"],
+                "company_name": session["company_name"],
+                "lead_meta": session.get("lead_meta", {}),
+                "transcript": [],
+                "exported": False,
+            }
+            CALL_RECORDS[call_sid] = record
+        record["status"] = "in-progress"
+        _persist_records()
 
     lead_meta = session.get("lead_meta", {})
     greeting = build_greeting(
@@ -474,145 +784,128 @@ async def twilio_voice_entry(
         team_size=lead_meta.get("team_size", ""),
         primary_interest=lead_meta.get("primary_interest", ""),
     )
-    session["history"].append({"role": "assistant", "content": greeting})
-    record = CALL_RECORDS.get(CallSid)
-    if record is not None:
-        record["status"] = "in-progress"
-    record_message(CallSid, "assistant", greeting)
+    append_turn(session, "assistant", greeting)
+    record_message(call_sid, "assistant", greeting)
+    return gather_twiml(greeting, token=session.get("webhook_token", ""))
 
-    vr = VoiceResponse()
-    base = public_base_url()
-    action_url = f"{base}/twilio/respond" if base else "/twilio/respond"
-    gather = Gather(
-        input="speech",
-        method="POST",
-        action=action_url,
-        speech_timeout="auto",
-        timeout=6,
-        language="en-IN",
+
+@app.api_route("/twilio/respond", methods=["GET", "POST"])
+async def twilio_respond(request: Request):
+    query_token = request.query_params.get("token", "")
+    session = session_for_webhook_token(query_token)
+    params = await twilio_form(
+        request,
+        expected_token=session.get("webhook_token", "") if session else "",
     )
-    gather.say(greeting, voice="Polly.Aditi")
-    vr.append(gather)
-    vr.say("I didn't catch that. Feel free to reach out anytime. Goodbye!", voice="Polly.Aditi")
-    return Response(content=str(vr), media_type="application/xml")
+    call_sid = params.get("CallSid", "").strip()
+    if not call_sid:
+        return hangup_twiml("I cannot identify this call. Goodbye!")
+    return await twilio_respond_request(request, params, call_sid, params.get("SpeechResult", "").strip())
 
 
-@app.post("/twilio/respond")
-async def twilio_respond(
-    CallSid: str = Form(...),
-    SpeechResult: str = Form(default=""),
-):
-    session = CALL_SESSIONS.get(CallSid)
+async def twilio_respond_request(request: Request, params: dict, call_sid: str, speech: str) -> Response:
+    del request, params  # signature was verified by the caller
+    session = CALL_SESSIONS.get(call_sid)
     if not session:
-        vr = VoiceResponse()
-        vr.say("Thanks for your time today. Goodbye!", voice="Polly.Aditi")
-        vr.hangup()
-        return Response(content=str(vr), media_type="application/xml")
+        return hangup_twiml("Thanks for your time today. Goodbye!")
+    token = session.get("webhook_token", "")
 
-    vr = VoiceResponse()
-    spoken_in = SpeechResult.strip()
+    session["touch"] = time.monotonic()
+    record = CALL_RECORDS.get(call_sid)
+    if record is not None and record.get("status") != "completed":
+        record["status"] = "in-progress"
 
-    if not spoken_in:
+    if not speech:
         session["silence_count"] = session.get("silence_count", 0) + 1
         if session["silence_count"] >= 2:
             closing = "It seems we have a quiet line, so I will wrap up for now. Feel free to reach out anytime. Goodbye!"
-            record_message(CallSid, "assistant", closing)
-            vr.say(closing, voice="Polly.Aditi")
-            vr.hangup()
-            CALL_SESSIONS.pop(CallSid, None)
-            return Response(content=str(vr), media_type="application/xml")
-
-        base = public_base_url()
-        action_url = f"{base}/twilio/respond" if base else "/twilio/respond"
-        gather = Gather(
-            input="speech",
-            method="POST",
-            action=action_url,
-            speech_timeout="auto",
-            timeout=6,
-            language="en-IN",
-        )
-        gather.say("Sorry, I didn't quite catch that—could you repeat?", voice="Polly.Aditi")
-        vr.append(gather)
-        vr.say("I still didn't catch that. Feel free to reach out anytime. Goodbye!", voice="Polly.Aditi")
-        return Response(content=str(vr), media_type="application/xml")
+            record_message(call_sid, "assistant", closing)
+            finalize_call(call_sid, "completed")
+            await run_in_threadpool(export_lead_to_webhook, record or {})
+            return hangup_twiml(closing)
+        return gather_twiml("Sorry, I didn't quite catch that—could you repeat?", retry=True, token=token)
 
     session["silence_count"] = 0
-    session["history"].append({"role": "user", "content": spoken_in})
-    record_message(CallSid, "user", spoken_in)
+    speech = speech[:MAX_SPEECH_CHARS]
+    append_turn(session, "user", speech)
+    record_message(call_sid, "user", speech)
 
-    reply = None
-    try:
-        client, model = get_llm_client()
-        reply = generate_llm_reply(client, model, session["history"])
-    except Exception as exc:
-        logger.warning("Twilio LLM fallback triggered for %s: %s", CallSid, exc)
+    outcome = await run_in_threadpool(handle_intents, session, speech, record)
+    if outcome.dial_to:
+        record_message(call_sid, "assistant", "Connecting you with a colleague now.")
+        return dial_twiml(outcome.dial_to, token=token)
+    if outcome.reply:
+        reply = sanitize_for_tts(outcome.reply)
+        append_turn(session, "assistant", reply)
+        record_message(call_sid, "assistant", reply)
+        return gather_twiml(reply, token=token)
 
-    if not reply:
-        reply = fallback_reply(spoken_in)
+    response = await llm_reply(session)
+    if not response:
+        response = fallback_reply(speech)
+    spoken = sanitize_for_tts(response)
+    append_turn(session, "assistant", spoken)
+    record_message(call_sid, "assistant", spoken)
 
-    end_call = "[END_CALL]" in reply
-    spoken_reply = sanitize_for_tts(reply)
-    session["history"].append({"role": "assistant", "content": spoken_reply})
-    record_message(CallSid, "assistant", spoken_reply)
-
+    end_call = "[END_CALL]" in response or session.get("turn_count", 0) >= MAX_TURNS
+    session["turn_count"] = session.get("turn_count", 0) + 1
     if end_call:
-        vr.say(spoken_reply, voice="Polly.Aditi")
-        vr.hangup()
-        CALL_SESSIONS.pop(CallSid, None)
-    else:
-        base = public_base_url()
-        action_url = f"{base}/twilio/respond" if base else "/twilio/respond"
-        gather = Gather(
-            input="speech",
-            method="POST",
-            action=action_url,
-            speech_timeout="auto",
-            timeout=6,
-            language="en-IN",
-        )
-        gather.say(spoken_reply, voice="Polly.Aditi")
-        vr.append(gather)
-        vr.say("I didn't catch that. Feel free to reach out anytime. Goodbye!", voice="Polly.Aditi")
-
-    return Response(content=str(vr), media_type="application/xml")
+        finalize_call(call_sid, "completed")
+        if record is not None:
+            await run_in_threadpool(export_lead_to_webhook, record)
+        return hangup_twiml(spoken)
+    return gather_twiml(spoken, token=token)
 
 
 @app.post("/twilio/status")
-async def twilio_status(
-    CallSid: str = Form(...),
-    CallStatus: str = Form(default=""),
-    CallDuration: str = Form(default=""),
-):
-    record = CALL_RECORDS.get(CallSid)
+async def twilio_status(request: Request):
+    query_token = request.query_params.get("token", "")
+    session = session_for_webhook_token(query_token)
+    params = await twilio_form(
+        request,
+        expected_token=session.get("webhook_token", "") if session else "",
+    )
+    call_sid = params.get("CallSid", "").strip()
+    status = params.get("CallStatus", "").strip()
+    record = CALL_RECORDS.get(call_sid) if call_sid else None
     if record is not None:
-        if CallStatus:
-            record["status"] = CallStatus
-        if CallDuration:
-            record["duration"] = CallDuration
-        _persist_records()
-    if CallStatus in FINAL_CALL_STATUSES:
-        CALL_SESSIONS.pop(CallSid, None)
+        with STATE_LOCK:
+            if status:
+                record["status"] = status
+            if params.get("CallDuration"):
+                record["duration"] = params["CallDuration"]
+            _persist_records()
+    if status in FINAL_CALL_STATUSES:
+        finalize_call(call_sid, status)
+        if record is not None and status == "completed":
+            await run_in_threadpool(export_lead_to_webhook, record)
     return {"received": True}
 
 
-# --- 100% free browser voice demo (no Twilio, no phone number) ---
+@app.post("/twilio/handoff-status")
+async def twilio_handoff_status(request: Request):
+    query_token = request.query_params.get("token", "")
+    session = session_for_webhook_token(query_token)
+    params = await twilio_form(
+        request,
+        expected_token=session.get("webhook_token", "") if session else "",
+    )
+    call_sid = params.get("CallSid", "").strip()
+    status = params.get("DialCallStatus", "").strip()
+    call_sid = call_sid or params.get("ParentCallSid", "")
+    if call_sid in CALL_RECORDS:
+        CALL_RECORDS[call_sid]["handoff_status"] = status or "unknown"
+        record_message(call_sid, "assistant", f"Human handoff result: {status or 'unknown'}")
+    message = (
+        "Thanks for holding. Have a great day!"
+        if status in {"completed", "in-progress", "answered"}
+        else "I could not connect that call right now. Someone from the team will call you back. Goodbye!"
+    )
+    finalize_call(call_sid, "completed")
+    return hangup_twiml(message)
 
-class WebStartRequest(BaseModel):
-    lead_name: str = "Alex"
-    company_name: str = "Acme"
-    team_size: str = ""
-    primary_interest: str = ""
-    email: str = ""
 
-
-class WebTurnRequest(BaseModel):
-    session_id: str
-    message: str
-
-
-class WebEndRequest(BaseModel):
-    session_id: str
+# --- Routes: browser demo --------------------------------------------------
 
 
 @app.get("/web")
@@ -620,44 +913,32 @@ def browser_voice_demo():
     return FileResponse(STATIC_DIR / "voice.html")
 
 
-@app.post("/web/start")
-def web_start(payload: WebStartRequest):
+def _web_start(payload: WebStartRequest) -> dict:
+    purge_expired_sessions()
     lead_meta = {
         "team_size": payload.team_size.strip(),
         "primary_interest": payload.primary_interest.strip(),
         "email": payload.email.strip(),
     }
+    lead_name = payload.lead_name.strip() or "Alex"
+    company_name = payload.company_name.strip() or "Acme"
     greeting = build_greeting(
-        payload.lead_name,
-        payload.company_name,
+        lead_name,
+        company_name,
         team_size=lead_meta["team_size"],
         primary_interest=lead_meta["primary_interest"],
     )
     session_id = str(uuid.uuid4())
-    WEB_SESSIONS[session_id] = {
-        "lead_name": payload.lead_name,
-        "company_name": payload.company_name,
-        "lead_meta": lead_meta,
-        "history": [
-            {
-                "role": "system",
-                "content": build_system_prompt(
-                    payload.lead_name,
-                    payload.company_name,
-                    team_size=lead_meta["team_size"],
-                    primary_interest=lead_meta["primary_interest"],
-                ),
-            },
-            {"role": "assistant", "content": greeting},
-        ],
-    }
+    session = _new_session(lead_name, company_name, lead_meta)
+    session["history"].append({"role": "assistant", "content": greeting})
+    WEB_SESSIONS[session_id] = session
     CALL_RECORDS[session_id] = {
         "call_sid": session_id,
         "channel": "browser",
         "created_at": _utc_now_iso(),
         "to_number": "Browser Mic",
-        "lead_name": payload.lead_name,
-        "company_name": payload.company_name,
+        "lead_name": lead_name,
+        "company_name": company_name,
         "lead_meta": lead_meta,
         "status": "in-progress",
         "duration": "",
@@ -669,51 +950,47 @@ def web_start(payload: WebStartRequest):
     return {"session_id": session_id, "greeting": greeting}
 
 
+@app.post("/web/start")
+def web_start(request: Request, payload: WebStartRequest):
+    security.rate_limit(request, "web_start", limit=20)
+    return _web_start(payload)
+
+
 @app.post("/web/turn")
-def web_turn(payload: WebTurnRequest):
+async def web_turn(request: Request, payload: WebTurnRequest):
+    security.rate_limit(request, "web_turn", limit=40)
     session = WEB_SESSIONS.get(payload.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Unknown web session. Start a new call.")
-    message = payload.message.strip()
+    message = payload.message.strip()[:MAX_SPEECH_CHARS]
     if not message:
         raise HTTPException(status_code=400, detail="Empty message.")
-
-    session["history"].append({"role": "user", "content": message})
+    session["touch"] = time.monotonic()
+    append_turn(session, "user", message)
     record_message(payload.session_id, "user", message)
-
-    reply_text = None
-    mode = None
-    try:
-        client, model = get_llm_client()
-    except RuntimeError:
-        pass
-    else:
-        try:
-            reply_text = generate_llm_reply(client, model, session["history"])
-            if reply_text:
-                mode = model
-        except Exception as exc:
-            logger.warning("Web LLM fallback triggered for %s: %s", payload.session_id, exc)
-
-    if not reply_text:
-        reply_text = fallback_reply(message)
-        mode = "offline KB rules"
-
-    end_call = "[END_CALL]" in reply_text
-    spoken = sanitize_for_tts(reply_text)
-    session["history"].append({"role": "assistant", "content": spoken})
-    record_message(payload.session_id, "assistant", spoken)
-
     record = CALL_RECORDS.get(payload.session_id)
+
+    outcome = await run_in_threadpool(handle_intents, session, message, record)
+    if outcome.reply:
+        raw_reply = outcome.reply
+        mode = "integrations"
+    else:
+        reply_text = await llm_reply(session)
+        mode = os.getenv("LLM_MODEL", "gpt-4o-mini") if reply_text else "offline KB rules"
+        raw_reply = reply_text or fallback_reply(message)
+    reply = sanitize_for_tts(raw_reply)
+    append_turn(session, "assistant", reply)
+    record_message(payload.session_id, "assistant", reply)
+
+    end_call = "[END_CALL]" in raw_reply or session.get("turn_count", 0) >= MAX_TURNS
+    session["turn_count"] = session.get("turn_count", 0) + 1
     if end_call:
         WEB_SESSIONS.pop(payload.session_id, None)
+        finalize_call(payload.session_id, "completed")
         if record is not None:
-            record["status"] = "completed"
             export_lead_to_webhook(record)
-            _persist_records()
-
     return {
-        "reply": spoken,
+        "reply": reply,
         "end_call": end_call,
         "mode": mode,
         "qualification": record.get("qualification") if record else None,
@@ -723,10 +1000,20 @@ def web_turn(payload: WebTurnRequest):
 @app.post("/web/end")
 def web_end(payload: WebEndRequest):
     WEB_SESSIONS.pop(payload.session_id, None)
+    finalize_call(payload.session_id, "completed")
     record = CALL_RECORDS.get(payload.session_id)
     if record is not None:
-        if record.get("status") == "in-progress":
-            record["status"] = "completed"
         export_lead_to_webhook(record)
-        _persist_records()
     return {"ended": True}
+
+
+# Restrictive by default: same-origin requests work, arbitrary origins do not.
+_allowed_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if _allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_allowed_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "Authorization", "X-API-Token"],
+    )

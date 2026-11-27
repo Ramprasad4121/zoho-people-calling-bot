@@ -1,6 +1,12 @@
 {
   "product_name": "Zoho People",
-  "source_url": "https://www.zoho.com/people/features.html?src=people-header",
+  "source_url": "https://www.zoho.com/people/features.html",
+  "interloop": {
+    "name": "Interloop Consulting",
+    "description": "Interloop Consulting is a Zoho implementation partner with offices in India and the UAE, helping companies digitize HR and CRM processes.",
+    "credential": "Zoho Premium Partner of the Year 2025; 400+ client engagements.",
+    "source_url": "https://interloopconsulting.com/"
+  },
   "tagline": "Unleash the full potential of your diverse workforce",
   "social_proof": {
     "users": "1M+ Users",
@@ -129,6 +135,8 @@
   ],
   "pricing_india": {
     "currency": "INR",
+    "source_url": "https://www.zoho.com/people/zohopeople-pricing.html",
+    "verification_note": "India plan amounts come from the verified local knowledge base; Zoho renders live amounts in JavaScript, so confirm the final amount on the official pricing page before quoting a custom quote.",
     "free_trial": "30-day free trial on paid plans, no credit card required",
     "tax_note": "Prices exclude 18% GST; custom quotes available for 500+ users",
     "payroll_note": "Core Zoho People plans do not include payroll; payroll integrates via Zoho Payroll or the all-in-one Zoho People Plus suite",

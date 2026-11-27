@@ -78,6 +78,10 @@ code { color: #000; font-weight: 700; }
     <a href="/">← Lead Registration Console</a>
     <a href="/web">Browser Voice Demo →</a>
   </div>
+  <div style="margin-top:12px;max-width:420px;">
+    <label for="apiToken" style="display:block;font-size:12px;font-weight:700;margin-bottom:5px;">Console API token (required)</label>
+    <input id="apiToken" type="password" autocomplete="off" placeholder="Value of CALL_API_TOKEN on the server">
+  </div>
 
   <h2>Numbers to call</h2>
   <div class="row head">
@@ -97,8 +101,8 @@ code { color: #000; font-weight: 700; }
   </section>
 
   <p class="note">
-    Use international format like <code>+15551234567</code>. Twilio trial accounts can only call verified recipients and only in the sign-up country; the trial includes 75 voice minutes for 30 days.
-    Keep the tunnel URL private — anyone with it can start calls.
+    Use international format like <code>+15551234567</code>. Twilio trial accounts can only call verified recipients and only in the sign-up country.
+    Every phone call and transcript read requires the server's <code>CALL_API_TOKEN</code>; it is never stored in the browser beyond this tab session.
   </p>
 </main>
 
@@ -108,6 +112,13 @@ code { color: #000; font-weight: 700; }
   const DONE = new Set(["completed"]);
   const BAD = new Set(["error", "failed", "busy", "no-answer", "canceled"]);
   let launched = [];
+  const tokenInput = $("apiToken");
+  tokenInput.value = sessionStorage.getItem("aria_console_token") || "";
+  tokenInput.addEventListener("input", () => sessionStorage.setItem("aria_console_token", tokenInput.value.trim()));
+  function authHeaders() {
+    const token = tokenInput.value.trim();
+    return token ? { "X-API-Token": token } : {};
+  }
 
   function addRow(values = {}) {
     const row = document.createElement("div");
@@ -220,7 +231,7 @@ code { color: #000; font-weight: 700; }
 
   async function poll() {
     try {
-      const res = await fetch("/web/calls/status");
+      const res = await fetch("/web/calls/status", { headers: authHeaders() });
       if (!res.ok) return;
       const data = await res.json();
       const bySid = new Map(data.calls.map((call) => [call.call_sid, call]));
@@ -248,15 +259,19 @@ code { color: #000; font-weight: 700; }
       alert("Add at least one phone number.");
       return;
     }
+    if (!tokenInput.value.trim()) {
+      $("badge").textContent = "Enter the console API token first.";
+      return;
+    }
     const summary = contacts.map((c) => `${c.lead_name}: ${c.to_number}`).join("\n");
     if (!confirm(`Place ${contacts.length} call(s) now?\n\n${summary}\n\nTwilio minutes are used for each answered call.`)) return;
 
     $("callBtn").disabled = true;
-    $("badge").textContent = "Starting calls…";
+    $("badge").textContent = "Checking webhook and starting calls…";
     try {
       const res = await fetch("/web/calls", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ contacts }),
       });
       if (!res.ok) throw new Error(await res.text());

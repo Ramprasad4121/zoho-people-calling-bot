@@ -19,6 +19,14 @@ def sanitize_for_tts(text: str) -> str:
     return cleaned
 
 
+def llm_timeout_seconds() -> float:
+    """Twilio needs a TwiML response within ~15s; keep the LLM comfortably below that."""
+    try:
+        return max(2.0, min(float(os.getenv("LLM_TIMEOUT_SECONDS", "8")), 12.0))
+    except (TypeError, ValueError):
+        return 8.0
+
+
 def generate_llm_reply(client, model: str, history: list[dict]) -> str | None:
     """Call OpenAI-compatible LLM with voice-safe timeouts and reasoning-model handling."""
     kwargs = {
@@ -56,18 +64,21 @@ def fallback_reply(user_text: str) -> str:
     """Deterministic Zoho People KB responses when no LLM key is set or free tier is throttled."""
     text = user_text.lower()
     kb = load_knowledge_base()
+    plans = {p["name"].lower(): p for p in kb["pricing_india"]["plans"]}
+    cheapest = plans.get("essential hr", {}).get("annual_per_user_month", 48)
+    highest = plans.get("enterprise", {}).get("annual_per_user_month", 192)
 
     if any(w in text for w in ["bye", "goodbye", "thank you", "thanks", "that's all", "stop", "hang up", "wrap up"]):
         return (
-            "Thanks so much for your time today! I will send over the 30-day free trial details "
-            "and a calendar link right away. Have a great day! [END_CALL]"
+            "Thanks so much for your time today. I have noted your interest and the Interloop team "
+            "will follow up with the details. Have a great day! [END_CALL]"
         )
 
     if any(w in text for w in ["price", "cost", "pricing", "plan", "tier", "how much", "budget", "rupee", "inr"]):
         return (
-            "Zoho People starts free for up to 5 users, with paid plans from 48 rupees per user "
-            "per month on Essential HR up to 192 rupees for Enterprise billed annually, plus a 30-day free trial. "
-            "Roughly how many employees are in your team?"
+            f"Zoho People starts free for up to 5 users, with paid plans from {cheapest} rupees per user "
+            f"per month on Essential HR up to {highest} rupees for Enterprise billed annually, plus a 30-day free trial. "
+            "Prices exclude GST. Roughly how many employees are in your team?"
         )
 
     if any(w in text for w in ["payroll", "salary", "payslip", "expense", "reimburse", "pf", "tds"]):
@@ -112,17 +123,23 @@ def fallback_reply(user_text: str) -> str:
             "What is your current HR team size handling employee queries?"
         )
 
-    if any(w in text for w in ["zia", "ai", "automat", "workflow", "integrat", "crm", "greythr", "teams", "slack", "mobile", "app"]):
+    if any(w in text for w in ["zia", "ai", "automat", "workflow", "integrat", "crm", "teams", "slack", "mobile", "app"]):
         return (
-            "Zoho People includes Zia AI for conversational HR queries, no-code workflow automation, iOS and Android apps, "
-            "and native integrations with Zoho CRM, Microsoft Teams, Slack, and GreytHR. "
+            "Zoho People includes Zia AI for conversational HR queries, workflow automation, iOS and Android apps, "
+            "and native integrations with Zoho CRM, Microsoft Teams, and Slack. "
             "Which tools do you want Zoho People to connect with first?"
+        )
+
+    if any(w in text for w in ["human", "person", "agent", "manager", "transfer", "speak to someone"]):
+        return (
+            "Of course. I can connect you with a colleague at Interloop Consulting. "
+            "Would you like me to transfer you now?"
         )
 
     if any(w in text for w in ["demo", "trial", "book", "schedule", "yes", "sure", "interested", "sounds good", "send link"]):
         return (
-            "Wonderful, I can set up a 15-minute personalized demo or share your 30-day free trial link right after this call. "
-            "What email address should I send the invite to?"
+            "Wonderful, a 15-minute personalized demo or the 30-day free trial could both work. "
+            "What email address should I use for the invitation?"
         )
 
     size_match = re.search(r"\b(\d{1,5})\b", text)
@@ -133,7 +150,8 @@ def fallback_reply(user_text: str) -> str:
         elif count >= 500:
             rec = "we offer tailored Enterprise pricing and dedicated onboarding for teams of 500 plus"
         else:
-            rec = "our Professional or Premium plans fit teams that size really well, starting at 96 rupees per user monthly billed annually"
+            professional = plans.get("professional", {}).get("annual_per_user_month", 96)
+            rec = f"our Professional or Premium plans fit teams that size really well, starting at {professional} rupees per user monthly billed annually"
         return (
             f"Got it, for a team of {count}, {rec}. "
             "Which workflow matters most to you first: attendance and leave, onboarding, or performance tracking?"
@@ -155,10 +173,11 @@ def run_simulator(lead_name: str = "Alex", company_name: str = "Acme"):
     if use_llm:
         from openai import OpenAI
         base_url = os.getenv("LLM_BASE_URL")
+        timeout = llm_timeout_seconds()
         client = (
-            OpenAI(api_key=api_key, base_url=base_url, timeout=10.0, max_retries=0)
+            OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0)
             if base_url
-            else OpenAI(api_key=api_key, timeout=10.0, max_retries=0)
+            else OpenAI(api_key=api_key, timeout=timeout, max_retries=0)
         )
         print(f"[Simulator] Using live LLM ({model})")
     else:
